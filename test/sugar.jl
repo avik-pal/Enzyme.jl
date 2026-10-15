@@ -11,6 +11,17 @@ mul_vector(x, y) = [x[1]*y[2], x[2]*y[1]]
 end
 
 
+@testset "tupleconcat" begin
+    @test Enzyme.tupleconcat((1, 2)) === (1, 2)
+    @test Enzyme.tupleconcat((1, 2), (), (3.0,), ("a", [4])) == (1, 2, 3.0, "a", [4])
+    chunks = ntuple(i -> ntuple(j -> Float64(16 * (i - 1) + j), 16), 64)
+    @test Enzyme.tupleconcat(chunks...) === ntuple(Float64, 1024)
+
+    # Forward gradient in many chunks
+    x = collect(1.0:100.0)
+    @test gradient(Forward, x -> sum(abs2, x), x; chunk = Val(3))[1] ≈ 2 .* x
+end
+
 function diffsize(θ0, X)
     return copy(X)
 end
@@ -189,6 +200,14 @@ end
     @test res.derivs[1] ≈ [3.1 0.0; 0.0 2.7]
     @test res.derivs[2] == nothing
 
+end
+
+tupsq(t) = t[1]*t[2]
+
+@testset "Forward differing element tuple of floats" begin
+    res = Enzyme.gradient(Enzyme.Forward, tupsq, (3.0, Float32(2.0)))[1]
+    @test res[1] ≈ 2.0
+    @test res[2] ≈ 3.0
 end
 
 # these are used in gradient and jacobian tests

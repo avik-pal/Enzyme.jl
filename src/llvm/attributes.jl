@@ -1,4 +1,18 @@
 const nofreefns = Set{String}((
+    "jl_get_abi_converter",
+    "ijl_get_abi_converter",
+    "jl_f__compute_sparams",
+    "ijl_f__compute_sparams",
+    "jl_genericmemory_copyto",
+    "jl_get_binding_value_seqcst",
+    "ijl_get_binding_value_seqcst",
+        "jl_eval_globalref",
+        "ijl_eval_globalref",
+    "jl_lazy_load_and_lookup",
+    "ijl_lazy_load_and_lookup",
+    "utf8proc_toupper",
+        "utf8proc_isupper",
+        "utf8proc_islower",
     "ClientGetAddressableDevices",
     "ClientNumAddressableDevices",
     "BufferToDevice",
@@ -26,6 +40,8 @@ const nofreefns = Set{String}((
     "jl_f_isdefined",
     "ijl_field_index",
     "jl_field_index",
+    "ijl_get_field_offset",
+    "jl_get_field_offset",
     "ijl_specializations_get_linfo",
     "jl_specializations_get_linfo",
     "ijl_gf_invoke_lookup_worlds",
@@ -37,6 +53,8 @@ const nofreefns = Set{String}((
     "ijl_try_substrtod",
     "jl_try_substrtod",
     "jl_f__apply_iterate",
+    "jl_f_current_scope",
+    "ijl_f_current_scope",
     "ijl_field_index",
     "jl_field_index",
     "julia.call",
@@ -107,10 +125,18 @@ const nofreefns = Set{String}((
     "jl_get_ptls_states",
     "ijl_get_ptls_states",
     "jl_f_fieldtype",
+    "jl_f_sizeof",
+    "ijl_f_sizeof",
     "jl_symbol_n",
     "jl_stored_inline",
     "ijl_stored_inline",
     "jl_f_apply_type",
+        "jl_apply_tuple_type",
+        "ijl_apply_tuple_type",
+        "jl_apply_tuple_type_v",
+        "ijl_apply_tuple_type_v",
+        "jl_svec_fill",
+        "ijl_svec_fill",
     "jl_f_issubtype",
     "jl_isa",
     "ijl_isa",
@@ -138,6 +164,12 @@ const nofreefns = Set{String}((
     "_platform_memcmp",
     "memcmp",
     "julia.except_enter",
+    "jl_enter_handler",
+    "ijl_enter_handler",
+	"jl_setjmp",
+	"ijl_setjmp",
+    "__sigsetjmp",
+    "sigsetjmp",
     "jl_array_grow_end",
     "ijl_array_grow_end",
     "jl_f_getfield",
@@ -156,13 +188,76 @@ const nofreefns = Set{String}((
     "jl_symbol_n",
     "ijl_symbol_n",
     "uv_os_homedir",
+        "uv_random",
     "jl_array_to_string",
     "ijl_array_to_string",
     "pcre2_jit_compile_8",
     "memmove",
+    "cuStreamCreate",
+    "cuCtxGetCurrent",
+    "cuStreamGetCaptureInfo",
+        "cuStreamIsCapturing",
+    "cuStreamQuery",
+    "cuStreamSynchronize",
+    "cuMemGetInfo_v2",
+    "cuMemPoolCreate",
+    "cuDeviceSetMemPool",
+    "cuMemPoolSetAttribute",
+    "jl_gc_safe_enter",
+    "jl_gc_safe_leave",
+    "ijl_gc_is_in_finalizer",
+    "ijl_get_task_threadpoolid",
+    "jl_rand_ptls",
+    "ijl_wakeup_thread",
+    "ijl_safe_printf",
+    "ijl_threadpoolid",
+    "ijl_task_get_next",
+    "ijl_switch",
+    "ijl_process_events",
+    "utf8proc_category",
+    "jl_clock_now",
+    "ijl_new_task",
+    "cuMemPoolGetAttribute",
+    "ijl_hrtime",
+    "ijl_gc_collect",
+    "uv_thread_detach",
+    "uv_thread_create",
+    "cuDeviceCanAccessPeer",
+    "cuMemPoolSetAccess",
+    "cuMemcpyHtoDAsync_v2",
+    "cuDeviceGet",
+    "cuDeviceGetCount",
+    "cuDeviceGetAttribute",
+    "cuDevicePrimaryCtxRetain",
+    "cuCtxGetId",
+    "cuDeviceGetName",
+    "ijl_eqtable_get",
+    "cuCtxGetApiVersion",
+    "cuCtxSetCurrent",
+    # make_zero / make_zero! shadow-init bookkeeping (IdDict/IdSet seen-table queries)
+    "jl_field_isdefined_checked",
+    "ijl_field_isdefined_checked",
+    "jl_idset_peek_bp",
+    "ijl_idset_peek_bp",
 ))
 
 const inactivefns = Set{String}((
+    "jl_f__compute_sparams",
+    "ijl_f__compute_sparams",
+    
+    # The binding lookup is asserted as inactive [e.g. globals are considered constant wrt differentiation]
+    # If and when this changes, we need to change that here
+    "jl_get_binding_value_seqcst",
+    "ijl_get_binding_value_seqcst",
+        # Same for evaluating a `GlobalRef` (1.13 `Base.depwarn` reaches it through
+        # `invokelatest_gr`).
+        "jl_eval_globalref",
+        "ijl_eval_globalref",
+
+    "utf8proc_toupper",
+        "utf8proc_isupper",
+        "utf8proc_islower",
+        "cuStreamIsCapturing",
     "ClientGetAddressableDevices",
     "ClientNumAddressableDevices",
     "BufferToDevice",
@@ -178,6 +273,8 @@ const inactivefns = Set{String}((
     "jl_f_isdefined",
     "ijl_field_index",
     "jl_field_index",
+    "ijl_get_field_offset",
+    "jl_get_field_offset",
     "ijl_specializations_get_linfo",
     "jl_specializations_get_linfo",
     "ijl_gf_invoke_lookup_worlds",
@@ -186,6 +283,8 @@ const inactivefns = Set{String}((
     "jl_gc_get_total_bytes",
     "ijl_try_substrtod",
     "jl_try_substrtod",
+    "jl_f_current_scope",
+    "ijl_f_current_scope",
     "ijl_tagged_gensym",
     "jl_tagged_gensym",
     "jl_get_world_counter",
@@ -244,6 +343,12 @@ const inactivefns = Set{String}((
     "jl_stored_inline",
     "ijl_stored_inline",
     "jl_f_apply_type",
+        "jl_apply_tuple_type",
+        "ijl_apply_tuple_type",
+        "jl_apply_tuple_type_v",
+        "ijl_apply_tuple_type_v",
+        "jl_svec_fill",
+        "ijl_svec_fill",
     "jl_f_issubtype",
     "jl_isa",
     "ijl_isa",
@@ -251,11 +356,19 @@ const inactivefns = Set{String}((
     "ijl_matching_methods",
     "jl_excstack_state",
     "ijl_excstack_state",
+    "jl_enter_handler",
+    "ijl_enter_handler",
+	"jl_setjmp",
+	"ijl_setjmp",
+    "__sigsetjmp",
+    "sigsetjmp",		
     "jl_current_exception",
     "ijl_current_exception",
     "memhash_seed",
     "jl_f__typevar",
     "ijl_f__typevar",
+    "jl_f_sizeof",
+    "ijl_f_sizeof",
     "jl_f_isa",
     "ijl_f_isa",
     "jl_set_task_threadpoolid",
@@ -272,9 +385,15 @@ const inactivefns = Set{String}((
     "jl_symbol_n",
     "ijl_symbol_n",
     "uv_os_homedir",
+        "uv_random",
     "jl_array_to_string",
     "ijl_array_to_string",
     "pcre2_jit_compile_8",
+    # make_zero / make_zero! shadow-init bookkeeping (IdDict/IdSet seen-table queries)
+    "jl_field_isdefined_checked",
+    "ijl_field_isdefined_checked",
+    "jl_idset_peek_bp",
+    "ijl_idset_peek_bp",
     # "jl_"
 ))
 
@@ -317,6 +436,14 @@ function annotate!(mod::LLVM.Module)
         if haskey(globs, gname)
             glob = globs[gname]
             API.SetMD(glob, "enzyme_inactive", LLVM.MDNode(LLVM.Metadata[]))
+        end
+    end
+
+    for gname in keys(JuliaGlobalNameMap)
+        globs = LLVM.globals(mod)
+        if haskey(globs, gname)
+            glob = globs[gname]
+            API.SetMD(glob, "enzyme_ta_norecur", LLVM.MDNode(LLVM.Metadata[]))
         end
     end
 
@@ -504,6 +631,7 @@ function annotate!(mod::LLVM.Module)
         end
     end
 
+
     for fname in (
         "jl_f_getfield",
         "ijl_f_getfield",
@@ -511,6 +639,8 @@ function annotate!(mod::LLVM.Module)
         "ijl_get_nth_field_checked",
         "jl_f__svec_ref",
         "ijl_f__svec_ref",
+        "jl_f_current_scope",
+        "ijl_f_current_scope",
         "UnsafeBufferPointer"
     )
         if haskey(funcs, fname)
@@ -579,6 +709,10 @@ function annotate!(mod::LLVM.Module)
                     push!(function_attributes(fn), EnumAttribute("memory", NoEffects.data))
                 end
                 push!(function_attributes(fn), LLVM.StringAttribute("enzyme_shouldrecompute"))
+                push!(function_attributes(fn), EnumAttribute("nounwind"))
+                push!(function_attributes(fn), EnumAttribute("nosync"))
+                push!(function_attributes(fn), EnumAttribute("nofree"))
+                push!(function_attributes(fn), EnumAttribute("willreturn"))
             end
         end
     end
@@ -608,6 +742,19 @@ function annotate!(mod::LLVM.Module)
 
     for fname in (
         "julia.safepoint",
+    )
+        if haskey(funcs, fname)
+            for fn in funcs[fname]
+                push!(function_attributes(fn), EnumAttribute("nofree"))
+                push!(function_attributes(fn), EnumAttribute("nosync"))
+                push!(function_attributes(fn), EnumAttribute("nounwind"))
+                push!(function_attributes(fn), EnumAttribute("willreturn"))
+            end
+        end
+    end
+
+    for fname in (
+        "julia.safepoint",
         "ijl_pop_handler",
         "jl_pop_handler",
         "ijl_pop_handler_noexcept",
@@ -619,6 +766,12 @@ function annotate!(mod::LLVM.Module)
         "ijl_restore_excstack",
         "jl_restore_excstack",
         "julia.except_enter",
+        "jl_enter_handler",
+        "ijl_enter_handler",
+		"jl_setjmp",
+		"ijl_setjmp",
+        "__sigsetjmp",
+        "sigsetjmp",
         "ijl_get_nth_field_checked",
         "jl_get_nth_field_checked",
         "jl_egal__unboxed",
@@ -666,6 +819,12 @@ function annotate!(mod::LLVM.Module)
         "ijl_restore_excstack",
         "jl_restore_excstack",
         "julia.except_enter",
+        "jl_enter_handler",
+        "ijl_enter_handler",
+		"jl_setjmp",
+		"ijl_setjmp",
+        "__sigsetjmp",
+        "sigsetjmp",
         "ijl_get_nth_field_checked",
         "jl_get_nth_field_checked",
         "jl_egal__unboxed",
@@ -686,7 +845,7 @@ function annotate!(mod::LLVM.Module)
 
 
 
-    for fname in ("julia.pointer_from_objref",)
+    for fname in ("julia.pointer_from_objref", "julia_pointer_from_objref")
         if haskey(funcs, fname)
             for fn in funcs[fname]
                 if LLVM.version().major <= 15
@@ -694,6 +853,8 @@ function annotate!(mod::LLVM.Module)
                 else
                     push!(function_attributes(fn), EnumAttribute("memory", NoEffects.data))
                 end
+                push!(function_attributes(fn), LLVM.EnumAttribute("nounwind"))
+                push!(function_attributes(fn), LLVM.EnumAttribute("willreturn"))
             end
         end
     end
@@ -722,14 +883,14 @@ function annotate!(mod::LLVM.Module)
         "ijl_gc_alloc_typed",
         "jl_alloc_genericmemory",
         "ijl_alloc_genericmemory",
+	"jl_alloc_genericmemory_unchecked",
+	"ijl_alloc_genericmemory_unchecked",
         "jl_alloc_array_1d",
         "jl_alloc_array_2d",
         "jl_alloc_array_3d",
         "ijl_alloc_array_1d",
         "ijl_alloc_array_2d",
         "ijl_alloc_array_3d",
-        "jl_alloc_genericmemory",
-        "ijl_alloc_genericmemory",
         "ijl_new_array",
         "jl_new_array"
     )
@@ -783,6 +944,8 @@ function annotate!(mod::LLVM.Module)
         "ijl_box_int64",
         "jl_alloc_genericmemory",
         "ijl_alloc_genericmemory",
+	"jl_alloc_genericmemory_unchecked",
+	"ijl_alloc_genericmemory_unchecked",
         "jl_alloc_array_1d",
         "jl_alloc_array_2d",
         "jl_alloc_array_3d",
@@ -795,8 +958,6 @@ function annotate!(mod::LLVM.Module)
         "ijl_genericmemory_slice",
         "jl_genericmemory_copy_slice",
         "ijl_genericmemory_copy_slice",
-        "jl_alloc_genericmemory",
-        "ijl_alloc_genericmemory",
         "jl_idtable_rehash",
         "ijl_idtable_rehash",
         "jl_f_tuple",
@@ -862,8 +1023,11 @@ function annotate!(mod::LLVM.Module)
                     if cf == fn
                         LLVM.API.LLVMAddCallSiteAttribute(
                             c,
-                            LLVM.API.LLVMAttributeReturnIndex,
-                            LLVM.StringAttribute("enzyme_ReadOnlyOrThrow"),
+                            reinterpret(
+                                LLVM.API.LLVMAttributeIndex,
+                                LLVM.API.LLVMAttributeFunctionIndex,
+                            ),
+                            LLVM.StringAttribute("enzyme_LocalReadOnlyOrThrow"),
                         )
                         LLVM.API.LLVMAddCallSiteAttribute(
                             c,

@@ -122,3 +122,296 @@ end
     res = Enzyme.gradient(Enzyme.Forward, insfwdfunc, [0.5, 0.7])[1]
     @test res ≈ [0.0, 0.0]
 end
+
+function use(x)
+    use(x[1]) * use(x[2])
+end
+function use(x::Vector{Float64})
+    @inbounds x[1]
+end
+function tupq(x, y)
+    res = (Base.inferencebarrier(x), y)
+    use(res)::Float64
+end
+
+@testset "Runtime Activity Tuple Construction" begin
+    x = [2.0]
+    y = [3.0]
+    dy = [0.0]
+
+    @test_throws Enzyme.Compiler.EnzymeRuntimeActivityError Enzyme.autodiff(Reverse, tupq, Const(x), Duplicated(y, dy))
+
+    x = [2.0]
+    y = [3.0]
+    dy = [0.0]
+    Enzyme.autodiff(set_runtime_activity(Reverse), tupq, Const(x), Duplicated(y, dy))
+    
+    @test x ≈ [2.0]
+    @test y ≈ [3.0]
+    @test dy ≈ [2.0]
+end
+
+@noinline function setone(rany)
+   rany[] = 1.0
+   nothing
+end
+
+function typeunstable_constant_shadow()
+        rany = Ref{Any}()
+        setone(rany)
+        return rany[]
+end
+
+@testset "Zero type unstable shadow" begin
+   fwd, _ = autodiff_thunk(ReverseSplitNoPrimal, Const{typeof(typeunstable_constant_shadow)}, Active{Float64})
+   _, _, shad = fwd(Const(typeunstable_constant_shadow))
+end
+
+kwcallee(x; saveat) = x + saveat # callee takes a keyword argument
+typeunstable_kwloss(x, r) = kwcallee(x; saveat = r[])
+
+@testset "Inactive argument to new struct" begin
+	@test Enzyme.gradient(Enzyme.Reverse, typeunstable_kwloss, 2.7, Enzyme.Const(Base.RefValue{Any}(3.1)))[1] ≈ 1.0
+end
+
+@noinline newstruct_runtime_any()::Any = Base.inferencebarrier(Ref(1.0))
+
+mutable struct NewstructConstField{T}
+    v::Float64
+    inner::T
+end
+
+function newstruct_const_active_field(x)
+    w = NewstructConstField(0.0, newstruct_runtime_any())
+    w.v = sum(abs2, x)
+    return w.v
+end
+
+@testset "Runtime newstruct with constant active-typed field" begin
+    g = Enzyme.gradient(
+        set_runtime_activity(Reverse), newstruct_const_active_field, [3.0, 1.0]
+    )[1]
+    @test g ≈ [6.0, 2.0]
+end
+
+@noinline mutwrap_runtime_any()::Any = Base.inferencebarrier(Ref(1.0))
+
+mutable struct MutWrapGeneric{T}
+    v::Float64
+    inner::T
+end
+
+@noinline mutwrap_use(w, x) = w.v * @inbounds x[1]
+
+function mutwrap_generic_call(x)
+    w = MutWrapGeneric(0.0, mutwrap_runtime_any())
+    w.v = x[2]
+    f = Base.inferencebarrier(mutwrap_use)
+    return (f(w, x))::Float64
+end
+
+@testset "Mutable runtime newstruct shadow passed to generic call" begin
+    g = Enzyme.gradient(
+        set_runtime_activity(Reverse), mutwrap_generic_call, [3.0, 5.0]
+    )[1]
+    @test g ≈ [5.0, 3.0]
+end
+
+# ODEProblem-shaped immutable struct, parameterized by `iip`.
+struct Prob3246{iip, U, T, P}
+    u0::U      # inactive array
+    tspan::T   # inactive isbits tuple
+    p::P       # active array
+end
+Prob3246{iip}(u0, tspan, p) where {iip} =
+    Prob3246{iip, typeof(u0), typeof(tspan), typeof(p)}(u0, tspan, p)
+
+@noinline build_3246(u0, tspan, p, flag) = Prob3246{flag}(u0, tspan, p)
+
+function loss_3246(p, flag)
+    sum(abs2, build_3246([1.0, 2.0], (0.0, 1.0), p, flag).p)
+end
+
+@testset "Issue 3246 HVP with runtime activity" begin
+    RA_R = Enzyme.set_runtime_activity(Enzyme.Reverse)
+    RA_F = Enzyme.set_runtime_activity(Enzyme.Forward)
+    
+    FLAG = Ref(true)
+    runtime_iip() = FLAG[]
+    
+    grad(x) = Enzyme.gradient(RA_R, p -> loss_3246(p, runtime_iip()), x)[1]
+    
+    x0 = [1.0, 2.0, 3.0]
+    v = [1.0, 0.0, 0.0]
+    
+    res = Enzyme.autodiff(RA_F, Enzyme.Const(grad), Enzyme.Duplicated(x0, v))
+    @test res[1] ≈ [2.0, 0.0, 0.0]
+end
+
+struct TypeUnstableGetfieldBox{T1, T2}
+    a::T1
+    b::T2
+end
+
+@noinline function getfield_unstable_fn(x, idx)
+    box = TypeUnstableGetfieldBox(1.0, x)
+    val = getfield(box, idx)
+    return val[1] * val[2]
+end
+
+@testset "Forward type-unstable getfield" begin
+    idx = Base.inferencebarrier(2)
+    res = Enzyme.autodiff(set_runtime_activity(Forward), getfield_unstable_fn, Duplicated([2.0, 3.0], [1.0, 0.0]), Const(idx))
+    @test res[1] ≈ 3.0
+end
+
+struct MiniProblem3280{U, P, K}
+    u0::U
+    tspan::Tuple{Float64, Float64}
+    p::P
+    kwargs::K
+end
+
+function loss_3280(p)
+    prob = MiniProblem3280([1.0], (0.0, 1.0), p, pairs((;)))
+    active_field = Enzyme.Compiler.idx_jl_getfield_aug(
+        Val(NamedTuple{(1,)}), prob, Val{2}, Val(false))
+    return sum(abs2, active_field)
+end
+
+@testset "idx_jl_getfield_aug calling convention (Issue 3280 reproducer)" begin
+    p = [0.5]
+    dp = zero(p)
+    Enzyme.autodiff(set_runtime_activity(Reverse), Enzyme.Const(loss_3280), Enzyme.Active,
+        Enzyme.Duplicated(p, dp))
+    @test dp ≈ [1.0]
+end
+
+mutable struct SetpropertyBox
+    x::Vector{Float64}
+end
+
+function loss_setproperty_mwe(x)
+    box = SetpropertyBox(zeros(length(x)))
+    setproperty!(Base.inferencebarrier(box), Base.inferencebarrier(:x), x)
+    return sum(abs2, box.x)
+end
+
+@testset "Forward type-unstable setproperty! with runtime activity" begin
+    @test Enzyme.autodiff(
+        Enzyme.Forward,
+        Enzyme.Const(loss_setproperty_mwe),
+        Enzyme.Duplicated([0.5], [1.0]),
+    ) == (1.0,)
+
+    @test Enzyme.autodiff(
+        Enzyme.set_runtime_activity(Enzyme.Forward),
+        Enzyme.Const(loss_setproperty_mwe),
+        Enzyme.Duplicated([0.5], [1.0]),
+    ) == (1.0,)
+end
+
+# Issue 3425: an `Active` return whose inferred type is abstract routes combined
+# reverse mode through the split (augmented forward + adjoint) path.  For a batched
+# call the return annotation handed to that path must carry the batch width,
+# otherwise the caller-side ABI reserves a single shadow slot while the generated
+# adjoint writes `width` of them, smashing the caller's gcframe.
+@noinline unstable_tuple_3425(p) = Base.inferencebarrier((p[1], p[2]))
+unstable_batch_3425(p) = (y = unstable_tuple_3425(p); y[1]^2 + y[2]^2)
+
+@testset "Issue 3425 batched abstract active return" begin
+    p = [1.0, 2.0]
+    for width in 1:3
+        dps = Tuple([zero(p) for _ in 1:width])
+        arg = width == 1 ? Duplicated(p, dps[1]) : BatchDuplicated(p, dps)
+        Enzyme.autodiff(Reverse, unstable_batch_3425, Active, arg)
+        for dp in dps
+            @test dp ≈ [2.0, 4.0]
+        end
+    end
+end
+
+batched_uninferred_target(x) = (2 .* x,)
+batched_uninferred_return(x) = Base.invokelatest(batched_uninferred_target, x)
+
+@testset "Batched forward concrete annotation with uninferred return" begin
+    x = [1.0, 2.0]
+    dx1 = ones(2)
+    dx2 = fill(3.0, 2)
+    return_activity = BatchDuplicated{Tuple{Vector{Float64}}, 2}
+    result = Enzyme.autodiff(
+        Enzyme.set_runtime_activity(Forward), Const(batched_uninferred_return),
+        return_activity, BatchDuplicated(x, (dx1, dx2))
+    )
+    @test result[1][1][1] == [2.0, 2.0]
+    @test result[1][2][1] == [6.0, 6.0]
+end
+
+mutable struct RTSetfieldSeedBox
+    v::Any
+end
+
+# The runtime setfield rules run when jl_f_setfield is differentiated directly,
+# e.g. inside setproperty!(::RefValue{Float64}, ::Symbol, ::Any) once that call
+# is not routed through the runtime-generic path. The shadow field is the
+# adjoint slot of the stored value: it may already hold a seed from the caller,
+# which only the reverse rule may consume and clear.
+@testset "Runtime setfield keeps the shadow seed" begin
+    aug = Enzyme.Compiler.rt_jl_setfield_aug
+    rev = Enzyme.Compiler.rt_jl_setfield_rev
+
+    dout = Ref(1.0)
+    dval = Ref(0.0)
+    aug(dout, :x, Val(false), 4.0, dval)
+    @test dout[] == 1.0
+    rev(dout, :x, Val(false), 4.0, dval)
+    @test dval[] == 1.0
+    @test dout[] == 0.0
+
+    # A constant store lets nothing flow, but still overwrites the slot.
+    dout = Ref(1.0)
+    aug(dout, :x, Val(true), 4.0, nothing)
+    @test dout[] == 1.0
+    rev(dout, :x, Val(true), 4.0, nothing)
+    @test dout[] == 0.0
+
+    # An untyped field only needs a fresh zero when it holds another type.
+    dbox = RTSetfieldSeedBox(nothing)
+    aug(dbox, :v, Val(false), 4.0, Ref(0.0))
+    @test dbox.v === 0.0
+    dbox = RTSetfieldSeedBox(2.0)
+    aug(dbox, :v, Val(false), 4.0, Ref(0.0))
+    @test dbox.v === 2.0
+
+    # That fresh zero is what the reverse of a later read of the field
+    # accumulates into: rt_jl_getfield_rev takes the activity of the slot from
+    # the type of the value it currently holds, so a slot still holding the
+    # previous `nothing` would drop the adjoint and leave nothing for the
+    # store's reverse to pass on.
+    getrev = Enzyme.Compiler.rt_jl_getfield_rev
+    dbox = RTSetfieldSeedBox(nothing)
+    dval = Ref(0.0)
+    aug(dbox, :v, Val(false), 4.0, dval)
+    getrev(dbox, Ref(1.0), Val{:v}, Val(false))
+    @test dbox.v === 1.0
+    rev(dbox, :v, Val(false), 4.0, dval)
+    @test dval[] == 1.0
+    @test dbox.v === 0.0
+end
+
+sum_log(x) = sum(log, x)
+
+function sum_log_gradient!(dx, x)
+    Enzyme.autodiff(Reverse, sum_log, Active, Duplicated(x, dx))
+    return nothing
+end
+
+@testset "Function argument passed through mapreduce" begin
+    # `sum(log, x)` passes `log` through `Base._mapreduce_dim`, which must inline,
+    # otherwise it is invoked despecialized on `log::Function`, dynamically.
+    x = [0.5, 2.0, 4.0]
+    dx = zero(x)
+    sum_log_gradient!(dx, x)
+    @test dx ≈ 1 ./ x
+    @test (@allocated sum_log_gradient!(dx, x)) == 0
+end

@@ -34,42 +34,36 @@ const tm = Ref{TargetMachine}() # for opt pipeline
 get_tm() = tm[]
 get_jit() = jit[].jit
 
-function absolute_symbol_materialization(name, ptr)
+symbol_pair_type() =
+    LLVM.version() >= v"15" ? LLVM.API.LLVMOrcCSymbolMapPair : LLVM.API.LLVMJITCSymbolMapPair
+
+function absolute_symbol_pair(name, ptr)
     address = LLVM.API.LLVMOrcJITTargetAddress(reinterpret(UInt, ptr))
     flags = LLVM.API.LLVMJITSymbolFlags(LLVM.API.LLVMJITSymbolGenericFlagsExported, 0)
     symbol = LLVM.API.LLVMJITEvaluatedSymbol(address, flags)
-    gv = if LLVM.version() >= v"15"
-        LLVM.API.LLVMOrcCSymbolMapPair(name, symbol)
-    else
-        LLVM.API.LLVMJITCSymbolMapPair(name, symbol)
-    end
-    return LLVM.absolute_symbols(Ref(gv))
+    return symbol_pair_type()(name, symbol)
 end
 
+absolute_symbol_materialization(name, ptr) = LLVM.absolute_symbols(Ref(absolute_symbol_pair(name, ptr)))
+
 const hnd_string_map = Dict{String, Ref{Ptr{Cvoid}}}()
+const hnd_int_map = Dict{Int, Ref{Ptr{Cvoid}}}()
 
 function fix_ptr_lookup(name)
     if startswith(name, "ejlstr\$") || startswith(name, "ejlptr\$")
         _, fname, arg1 = split(name, "\$")
         if startswith(name, "ejlstr\$")
-            ptr = if haskey(hnd_string_map, arg1)
-                hnd_string_map[arg1]
-            else
-                val = Ref{Ptr{Cvoid}}(C_NULL)
-                hnd_string_map[arg1] = val
-                val
+            hnd_cache = get!(hnd_string_map, arg1) do
+                Ref{Ptr{Cvoid}}(C_NULL)
             end
-
-            return ccall(
-                :ijl_load_and_lookup,
-                Ptr{Cvoid},
-                (Cstring, Cstring, Ptr{Cvoid}),
-                arg1,
-                fname,
-                ptr
-            )
         else
+            arg1 =  parse(Int, arg1)
+            hnd_cache = get!(hnd_int_map, arg1) do
+                Ref{Ptr{Cvoid}}(C_NULL)
+            end
+            arg1 = reinterpret(Ptr{Cchar}, arg1)
         end
+        return @ccall jl_load_and_lookup(arg1::Cstring, fname::Cstring, hnd_cache::Ptr{Cvoid})::Ptr{Cvoid}
     end
     return nothing
 end
@@ -93,11 +87,11 @@ function setup_globals()
         optlevel = LLVM.API.LLVMCodeGenLevelAggressive
     end
 
-    tempTM = LLVM.JITTargetMachine(LLVM.triple(), cpu_name(), cpu_features(); optlevel)
+    lljit = JuliaOJIT()
+
+    tempTM = LLVM.JITTargetMachine(LLVM.triple(lljit), cpu_name(), cpu_features(); optlevel)
     LLVM.asm_verbosity!(tempTM, true)
     tm[] = tempTM
-
-    lljit = JuliaOJIT()
 
     jd_main = JITDylib(lljit)
 
@@ -126,22 +120,18 @@ function __init__()
         define_absolute_symbol(jd_main, mangle(lljit, "___chkstk_ms"))
     end
 
+    # The well-known Julia values, defined in one go.
     hnd = unsafe_load(cglobal(:jl_libjulia_handle, Ptr{Cvoid}))
-    for (k, v) in Compiler.JuliaGlobalNameMap
+    pairs = symbol_pair_type()[]
+    for k in keys(Compiler.JuliaGlobalNameMap)
         ptr = unsafe_load(Base.reinterpret(Ptr{Ptr{Cvoid}}, Libdl.dlsym(hnd, k)))
-        LLVM.define(
-            jd_main,
-            absolute_symbol_materialization(mangle(lljit, "ejl_" * k), ptr),
-        )
+        push!(pairs, absolute_symbol_pair(mangle(lljit, "ejl_" * k), ptr))
     end
-
     for (k, v) in Compiler.JuliaEnzymeNameMap
-        ptr = Compiler.unsafe_to_ptr(v)
-        LLVM.define(
-            jd_main,
-            absolute_symbol_materialization(mangle(lljit, "ejl_" * k), ptr),
-        )
+        ptr = Compiler.unsafe_to_ptr(Compiler.unbind(v))
+        push!(pairs, absolute_symbol_pair(mangle(lljit, "ejl_" * k), ptr))
     end
+    LLVM.define(jd_main, LLVM.absolute_symbols(pairs))
 
     atexit() do
         dispose(tm[])
@@ -155,7 +145,7 @@ function move_to_threadsafe(ir)
     buf = convert(MemoryBuffer, ir)
 
     # 2. deserialize and wrap by a ThreadSafeModule
-    return ThreadSafeContext() do ctx
+    return @dispose ctx = ThreadSafeContext() begin
         mod = parse(LLVM.Module, buf)
         ThreadSafeModule(mod)
     end
@@ -176,7 +166,35 @@ function add_trampoline!(jd, (lljit, lctm, ism), entry, target)
     mu = LLVM.reexports(lctm, ism, jd, [alias])
     LLVM.define(jd, mu)
 
-    LLVM.lookup(lljit, entry)
+    LLVM.lookup(lljit, jd, entry)
+end
+
+function prepare!(mod)
+    # On Windows, LLVM's GlobalOpt demotes internal functions to `private` linkage,
+    # which emits no object symbol. Julia's per-symbol Win64 JIT unwind registrar
+    # (create_PRUNTIME_FUNCTION) then skips those functions, so their frames get no
+    # RUNTIME_FUNCTION and a fault (e.g. a GC safepoint) landing on one defeats
+    # Windows exception dispatch. Promote them back to `internal` here -- the last
+    # step before JIT emission, after all optimization -- so they keep a local
+    # symbol and get registered. See EnzymeAD/Enzyme.jl#3374.
+    if Sys.iswindows()
+        for f in functions(mod)
+            if !LLVM.isdeclaration(f) && LLVM.linkage(f) == LLVM.API.LLVMPrivateLinkage
+                LLVM.linkage!(f, LLVM.API.LLVMInternalLinkage)
+            end
+        end
+    end
+    for f in collect(functions(mod))
+        ptr = fix_ptr_lookup(LLVM.name(f))
+        if ptr === nothing
+            continue
+        end
+        ptr = reinterpret(UInt, ptr)
+        ptr = LLVM.ConstantInt(ptr)
+        ptr = LLVM.const_inttoptr(ptr, LLVM.PointerType(LLVM.function_type(f)))
+        replace_uses!(f, ptr)
+        Compiler.eraseInst(mod, f)
+    end
 end
 
 function get_trampoline(job)
@@ -223,6 +241,7 @@ function get_trampoline(job)
                 Compiler.eraseInst(mod, other_func)
             end
 
+	    prepare!(mod)
             tsm = move_to_threadsafe(mod)
 
             il = LLVM.IRCompileLayer(lljit)
@@ -247,26 +266,21 @@ function get_trampoline(job)
 end
 
 function add!(mod)
-    for f in collect(functions(mod))
-        ptr = fix_ptr_lookup(LLVM.name(f))
-        if ptr === nothing
-            continue
-        end
-        ptr = reinterpret(UInt, ptr)
-        ptr = LLVM.ConstantInt(ptr)
-        ptr = LLVM.const_inttoptr(ptr, LLVM.PointerType(LLVM.function_type(f)))
-        replace_uses!(f, ptr)
-        Compiler.eraseInst(mod, f)
-    end
+    prepare!(mod)
     lljit = jit[].jit
     jd = LLVM.JITDylib(lljit)
     tsm = move_to_threadsafe(mod)
     LLVM.add!(lljit, jd, tsm)
-    return nothing
+    return jd
 end
 
 function lookup(name)
-    LLVM.lookup(jit[].jit, name)
+    lljit = jit[].jit
+    LLVM.lookup(lljit, JITDylib(lljit), name)
+end
+
+function lookup(jd::JITDylib, name)
+    LLVM.lookup(jit[].jit, jd, name)
 end
 
 end # module

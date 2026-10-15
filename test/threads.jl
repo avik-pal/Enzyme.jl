@@ -15,7 +15,10 @@ using Test
     R = Float64[0., 0.]
     dR = Float64[2., 3.]
 
-    @test 5.0 ≈ Enzyme.autodiff(Reverse, tasktest, Duplicated(R, dR), Active(2.0))[1][2]
+    # We define the local variable `autodiff` as a `Ref` wrapper only to be able to capture
+    # and test the warning emitted by the `@generated` function `Enzyme.autodiff`.
+    autodiff = Ref{Any}(Enzyme.autodiff)
+    @test 5.0 ≈ @test_warn r"active variables passed by value to jl_new_task are not yet supported" autodiff[](Reverse, tasktest, Duplicated(R, dR), Active(2.0))[1][2]
     @test Float64[2.0, 2.0] ≈ R
     @test Float64[0.0, 0.0] ≈ dR
     
@@ -30,7 +33,7 @@ using Test
         nothing
     end
     # The empty return previously resulted in an illegal instruction error
-    @test 0.0 ≈ Enzyme.autodiff(Reverse, tasktest2, Duplicated(R, dR), Active(2.0))[1][2]
+    @test 0.0 ≈ @test_warn r"active variables passed by value to jl_new_task are not yet supported" autodiff[](Reverse, tasktest2, Duplicated(R, dR), Active(2.0))[1][2]
     @test () === Enzyme.autodiff(Forward, tasktest, Duplicated(R, dR), Duplicated(2.0, 1.0))
 end
 
@@ -151,3 +154,24 @@ end
     @test ty[3] ≈ [8.0, 8.0]
     @test ty[4] ≈ [10.0, 10.0]
 end
+
+@testset "GEP non-inline type analysis" begin
+    function spread_no_broadcast!(bufs, q, ::Val{N}) where N
+        Threads.@threads for t in 1:N
+            for i in t:N:length(q)
+                @inbounds bufs[t][i, i + 1, i + 2] += q[i]
+            end
+        end
+        return sum(sum, bufs)
+    end
+
+    q = [1.0, 2.0]
+    dq = [0.0, 0.0]
+    bufs = [zeros(4, 4, 4) for _ in 1:2]
+    dbufs = [zeros(4, 4, 4) for _ in 1:2]
+
+    autodiff(ReverseWithPrimal, spread_no_broadcast!, Active, Duplicated(bufs, dbufs),
+             Duplicated(q, dq), Const(Val(2)))
+    @test dq ≈ [1.0, 1.0]
+end
+

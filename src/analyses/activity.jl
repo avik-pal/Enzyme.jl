@@ -9,71 +9,10 @@ end
     ActivityState(Int(a1) | Int(a2))
 end
 
-struct Merger{seen,worldT,justActive,UnionSret,AbstractIsMixed}
-    world::worldT
-end
-
 @inline element(::Val{T}) where {T} = T
 
-@inline function (c::Merger{seen,worldT,justActive,UnionSret,AbstractIsMixed})(
-    f::Int,
-) where {seen,worldT,justActive,UnionSret,AbstractIsMixed}
-    T = element(first(seen))
-
-    reftype = ismutabletype(T) || (T isa UnionAll && !AbstractIsMixed)
-
-    if justActive && reftype
-        return Val(AnyState)
-    end
-
-    subT = typed_fieldtype(T, f)
-
-    if justActive && ismutabletype(subT)
-        return Val(AnyState)
-    end
-
-    sub = active_reg_inner(
-        subT,
-        seen,
-        c.world,
-        Val(justActive),
-        Val(UnionSret),
-        Val(AbstractIsMixed),
-    )
-
-    if sub == AnyState
-        Val(AnyState)
-    else
-        if sub == DupState
-            if justActive
-                Val(AnyState)
-            else
-                Val(DupState)
-            end
-        else
-            if reftype
-                Val(DupState)
-            else
-                Val(sub)
-            end
-        end
-    end
-end
-
-@inline forcefold(::Val{RT}) where {RT} = RT
-
-@inline function forcefold(::Val{ty}, ::Val{sty}, C::Vararg{Any,N})::ActivityState where {ty,sty,N}
-    if sty == AnyState || sty == ty
-        return forcefold(Val(ty), C...)
-    end
-    if ty == AnyState
-        return forcefold(Val(sty), C...)
-    else
-        return MixedState
-    end
-end
-
 @inline ptreltype(::Type{Ptr{T}}) where {T} = T
+@inline ptreltype(::Type{Core.SimpleVector}) = Any
 @inline ptreltype(::Type{Core.LLVMPtr{T,N}}) where {T,N} = T
 @inline ptreltype(::Type{Core.LLVMPtr{T} where N}) where {T} = T
 @inline ptreltype(::Type{Base.RefValue{T}}) where {T} = T
@@ -81,7 +20,9 @@ end
 @inline ptreltype(::Type{Tuple{Vararg{T}}}) where {T} = T
 @inline ptreltype(::Type{IdDict{K,V}}) where {K,V} = V
 @inline ptreltype(::Type{IdDict{K,V} where K}) where {V} = V
+@static if Base.USE_GPL_LIBS
 @inline ptreltype(::Type{SparseArrays.CHOLMOD.Dense{T}}) where T = T
+end
 @static if VERSION < v"1.11-"
 else
 @inline ptreltype(::Type{Memory{T}}) where T = T
@@ -89,70 +30,71 @@ end
 
 @inline is_arrayorvararg_ty(::Type) = false
 @inline is_arrayorvararg_ty(::Type{Tuple{Vararg{T2}}}) where {T2} = true
+@inline is_arrayorvararg_ty(::Type{Core.SimpleVector}) = true
 @inline is_arrayorvararg_ty(::Type{Ptr{T}}) where {T} = true
 @inline is_arrayorvararg_ty(::Type{Core.LLVMPtr{T,N}}) where {T,N} = true
 @inline is_arrayorvararg_ty(::Type{Core.LLVMPtr{T,N} where N}) where {T} = true
 @inline is_arrayorvararg_ty(::Type{Base.RefValue{T}}) where {T} = true
 @inline is_arrayorvararg_ty(::Type{IdDict{K,V}}) where {K,V} = true
 @inline is_arrayorvararg_ty(::Type{IdDict{K,V} where K}) where {V} = true
+@static if Base.USE_GPL_LIBS
 @inline is_arrayorvararg_ty(::Type{SparseArrays.CHOLMOD.Dense{T}}) where T = true
+end
 @static if VERSION < v"1.11-"
 else
 @inline is_arrayorvararg_ty(::Type{Memory{T}}) where T = true
 end
 
-Base.@assume_effects :removable :foldable :nothrow @inline function staticInTup(::Val{T}, tup::NTuple{N,Val})::Bool where {T,N}
-    any(ntuple(Val(N)) do i
-        Base.@_inline_meta
-        Val(T) == tup[i]
-    end)
-end
-
-@inline function active_reg_recur(
-    ::Type{ST},
-    seen::Seen,
-    world,
-    ::Val{justActive},
-    ::Val{UnionSret},
-    ::Val{AbstractIsMixed},
-)::ActivityState where {ST,Seen,justActive,UnionSret,AbstractIsMixed}
+Base.@nospecializeinfer function active_reg_recur(
+    @nospecialize(ST::Type),
+    seen::Base.IdSet{Type},
+    world::UInt,
+    justActive::Bool,
+    UnionSret::Bool,
+    AbstractIsMixed::Bool,
+)::ActivityState
     if ST isa Union
-        return forcefold(
-            Val(
-                active_reg_recur(
-                    ST.a,
-                    seen,
-                    world,
-                    Val(justActive),
-                    Val(UnionSret),
-                    Val(AbstractIsMixed),
-                ),
-            ),
-            Val(
-                active_reg_recur(
-                    ST.b,
-                    seen,
-                    world,
-                    Val(justActive),
-                    Val(UnionSret),
-                    Val(AbstractIsMixed),
-                ),
-            ),
+        return (
+            active_reg_recur(
+                ST.a,
+                seen,
+                world,
+                justActive,
+                UnionSret,
+                AbstractIsMixed,
+            )
+            |
+            active_reg_recur(
+                ST.b,
+                seen,
+                world,
+                justActive,
+                UnionSret,
+                AbstractIsMixed,
+            )
         )
     end
     return active_reg_inner(
         ST,
         seen,
         world,
-        Val(justActive),
-        Val(UnionSret),
-        Val(AbstractIsMixed),
+        justActive,
+        UnionSret,
+        AbstractIsMixed,
     )
 end
 
 @inline is_vararg_tup(x) = false
 @inline is_vararg_tup(::Type{Tuple{Vararg{T2}}}) where {T2} = true
 
+"""
+    is_mutable_array(T::Type)::Bool
+
+Return `true` if `T` refers to mutable memory of elements of type `eltype(T)`, as an `Array`
+does. The activity of `T` then comes from `eltype(T)`. A package can add methods for its
+array or pointer types, for example in a package extension. Enzyme calls this function in
+the world of the compilation.
+"""
 Base.@nospecializeinfer @inline function is_mutable_array(@nospecialize(T::Type))
     if T <: Array
         return true
@@ -163,7 +105,7 @@ Base.@nospecializeinfer @inline function is_mutable_array(@nospecialize(T::Type)
     if T isa DataType
         if hasproperty(T, :name) && hasproperty(T.name, :module)
             mod = T.name.module
-            if string(mod) == "Reactant" && (T.name.name == :ConcretePJRTArray || T.name.name == :ConcreteIFRTArray || T.name.name == :TracedRArray)
+            if nameof(mod) === :Reactant && (T.name.name == :ConcretePJRTArray || T.name.name == :ConcreteIFRTArray || T.name.name == :TracedRArray)
                 return true
             end
         end
@@ -172,15 +114,17 @@ Base.@nospecializeinfer @inline function is_mutable_array(@nospecialize(T::Type)
 end
 
 Base.@nospecializeinfer @inline function is_wrapped_number(@nospecialize(T::Type))
-    if T isa UnionAll
-        return is_wrapped_number(T.body)
-    end
     while T isa UnionAll
         T = T.body
     end
     if T isa DataType && hasproperty(T, :name) && hasproperty(T.name, :module)
         mod = T.name.module
-        if string(mod) == "Reactant" && (T.name.name == :ConcretePJRTNumber || T.name.name == :ConcreteIFRTNumber || T.name.name == :TracedRNumber)
+        if nameof(mod) === :Reactant && T.name.name in (
+                :ConcretePJRTNumber, :ConcreteIFRTNumber, :TracedRNumber,
+                :TracedRInteger, :TracedRFloat, :TracedRComplex,
+                :ConcretePJRTInteger, :ConcretePJRTFloat, :ConcretePJRTComplex,
+                :ConcreteIFRTInteger, :ConcreteIFRTFloat, :ConcreteIFRTComplex,
+            )
             return true
         end
     end
@@ -194,15 +138,14 @@ Base.@nospecializeinfer @inline function unwrapped_number_type(@nospecialize(T::
     return T.parameters[1]
 end
 
-
-@inline function active_reg_inner(
-    ::Type{T},
-    seen::ST,
-    world::Union{Nothing,UInt},
-    ::Val{justActive} = Val(false),
-    ::Val{UnionSret} = Val(false),
-    ::Val{AbstractIsMixed} = Val(false),
-)::ActivityState where {ST,T,justActive,UnionSret,AbstractIsMixed}
+Base.@nospecializeinfer @inline function active_reg_inner(
+    @nospecialize(T::Type),
+    seen::Base.IdSet{Type},
+    world::UInt,
+    justActive::Bool,
+    UnionSret::Bool,
+    AbstractIsMixed::Bool,
+)::ActivityState
     if T === Any
         if AbstractIsMixed
             return MixedState
@@ -220,20 +163,15 @@ end
             ptreltype(T),
             seen,
             world,
-            Val(justActive),
-            Val(UnionSret),
-            Val(AbstractIsMixed),
+            justActive,
+            UnionSret,
+            AbstractIsMixed,
         )
     end
 
-    if T <: BigFloat
-        return DupState
-    end
-
-    if T <: AbstractFloat
-        return ActiveState
-    end
-
+    # Wrapped numbers are mutable references to their underlying value; they
+    # may subtype AbstractFloat (or Integer) and must be classified before the
+    # raw float/integer fast paths.
     if is_wrapped_number(T)
         if justActive
             return AnyState
@@ -243,9 +181,9 @@ end
             unwrapped_number_type(T),
             seen,
             world,
-            Val(justActive),
-            Val(UnionSret),
-            Val(AbstractIsMixed),
+            justActive,
+            UnionSret,
+            AbstractIsMixed,
         ) == AnyState
             return AnyState
         else
@@ -257,7 +195,16 @@ end
         end
     end
 
-    if is_mutable_array(T)
+    if T <: BigFloat
+        return DupState
+    end
+
+    if T <: AbstractFloat
+        return ActiveState
+    end
+
+    # Use _call_in_world_total to see the methods that packages add.
+    if Core._call_in_world_total(world, is_mutable_array, T)
         if justActive
             return AnyState
         end
@@ -266,9 +213,9 @@ end
             eltype(T),
             seen,
             world,
-            Val(justActive),
-            Val(UnionSret),
-            Val(AbstractIsMixed),
+            justActive,
+            UnionSret,
+            AbstractIsMixed,
         ) == AnyState
             return AnyState
         else
@@ -283,7 +230,7 @@ end
     if T <: Ptr ||
        T <: Core.LLVMPtr ||
        T <: Base.RefValue || is_arrayorvararg_ty(T)
-        if justActive
+        if justActive && !AbstractIsMixed
             return AnyState
         end
 
@@ -292,9 +239,9 @@ end
             ptreltype(T),
             seen,
             world,
-            Val(justActive),
-            Val(UnionSret),
-            Val(AbstractIsMixed),
+            justActive,
+            UnionSret,
+            AbstractIsMixed,
         ) == AnyState
             return AnyState
         else
@@ -306,7 +253,7 @@ end
         end
     end
 
-    if T <: Integer
+    if T <: Integer || T <: Enum
         return AnyState
     end
 
@@ -314,28 +261,8 @@ end
         return AnyState
     end
 
-    inactivety = if typeof(world) === Nothing
-        EnzymeCore.EnzymeRules.inactive_type(T)
-    else
-        inmi = my_methodinstance(
-            nothing,
-            typeof(EnzymeCore.EnzymeRules.inactive_type),
-            Tuple{Type{T}},
-            world,
-        )
-        args = Any[EnzymeCore.EnzymeRules.inactive_type, T]
-        GC.@preserve T begin
-            ccall(
-                :jl_invoke,
-                Any,
-                (Any, Ptr{Any}, Cuint, Any),
-                EnzymeCore.EnzymeRules.inactive_type,
-                args,
-                length(args),
-                inmi,
-            )
-        end
-    end
+    # Use _call_in_world_total to perform a concrete eval.
+    inactivety = Core._call_in_world_total(world, EnzymeCore.EnzymeRules.inactive_type, T)
 
     if inactivety
         return AnyState
@@ -368,15 +295,15 @@ end
                 T,
                 seen,
                 world,
-                Val(justActive),
-                Val(UnionSret),
-                Val(AbstractIsMixed),
+                justActive,
+                UnionSret,
+                AbstractIsMixed,
             )
         else
             if justActive
                 return AnyState
             end
-            if active_reg_inner(T.a, seen, world, Val(justActive), Val(UnionSret)) !=
+            if active_reg_inner(T.a, seen, world, justActive, UnionSret, false) !=
                AnyState
                 if AbstractIsMixed
                     return MixedState
@@ -384,7 +311,7 @@ end
                     return DupState
                 end
             end
-            if active_reg_inner(T.b, seen, world, Val(justActive), Val(UnionSret)) !=
+            if active_reg_inner(T.b, seen, world, justActive, UnionSret, false) !=
                AnyState
                 if AbstractIsMixed
                     return MixedState
@@ -436,63 +363,161 @@ end
         T
     end
 
-    if staticInTup(Val(nT), seen)
+    if nT in seen
         return MixedState
     end
 
-    seen2 = (Val(nT), seen...)
+    reftype = ismutabletype(nT) || (nT isa UnionAll && !AbstractIsMixed)
 
-    fty = Merger{seen2,typeof(world),justActive,UnionSret,AbstractIsMixed}(world)
+    if justActive && reftype
+        return AnyState
+    end
 
-    ty = forcefold(Val(AnyState), ntuple(fty, Val(fieldcount(nT)))...)
+    seen2 = copy(seen)
+    push!(seen2, nT)
+
+    ty = AnyState
+
+    for f in 1:typed_fieldcount(nT)
+        subT = typed_fieldtype(nT, f)
+
+        if justActive && ismutabletype(subT)
+            # AnyState
+            continue
+        end
+
+        sub = active_reg_inner(
+            subT,
+            seen2,
+            world,
+            justActive,
+            UnionSret,
+            AbstractIsMixed,
+        )
+
+        if sub == AnyState
+            continue
+        end
+
+        if sub == DupState && justActive
+            continue
+        end
+
+        if reftype
+            sub = DupState
+        end
+
+        ty |= sub
+    end
 
     return ty
 end
 
-Base.@assume_effects :removable :foldable @inline @generated function active_reg_nothrow(::Type{T}, ::Val{world})::ActivityState where {T,world}
-    return active_reg_inner(T, (), world)
-end
+const ActivityCache = Dict{Tuple{Type, Bool, Bool, Bool}, ActivityState}()
 
-Base.@assume_effects :removable :foldable @inline function active_reg(
-    ::Type{T},
-    world::Union{Nothing,UInt} = nothing,
-)::Bool where {T}
-    seen = ()
+const ActivityWorldCache = Ref(0)
 
-    # check if it could contain an active
-    if active_reg_inner(T, seen, world, Val(true)) == ActiveState #=justActive=#
-        state = active_reg_inner(T, seen, world, Val(false)) #=justActive=#
-        if state == ActiveState
-            return true
-        end
-        @assert state == MixedState
-        throw(
-            AssertionError(
-                string(T) *
-                " has mixed internal activity types. See https://enzyme.mit.edu/julia/stable/faq/#Mixed-activity for more information",
-            ),
-        )
-    else
-        return false
+const ActivityMethodCache = Core.MethodMatch[]
+
+# The signatures of the functions that packages can add methods to, and that change the
+# result of `active_reg`.
+const ActivityHookSigs = (
+    Tuple{typeof(EnzymeRules.inactive_type), Type},
+    Tuple{typeof(is_mutable_array), Type},
+)
+
+# given the current worldage of compilation, check if there are any methods 
+# of the activity hooks which may invalidate the cache, and if so clear it.
+function check_activity_cache_invalidations(world::UInt)
+    # We've already guaranteed that this world doesn't have any stale caches
+    if world <= ActivityWorldCache[]
+        return
     end
+
+    methods = Core.MethodMatch[]
+    for tt in ActivityHookSigs
+        matches = Base._methods_by_ftype(tt, -1, world)
+        if matches === nothing
+            @assert ActivityCache.size() == 0
+            return
+        end
+        for match in matches::Vector
+            push!(methods, match::Core.MethodMatch)
+        end
+    end
+
+    if methods == ActivityMethodCache
+        return
+    end
+
+    empty!(ActivityCache)
+    empty!(ActivityMethodCache)
+    for match in methods
+        push!(ActivityMethodCache, match)
+    end
+
+    ActivityWorldCache[] = world
+
 end
 
-Base.@assume_effects :removable :foldable :nothrow @inline function guaranteed_const(::Type{T})::Bool where {T}
-    rt = active_reg_nothrow(T, Val(nothing))
+Base.@nospecializeinfer @inline function active_reg(@nospecialize(ST::Type), world::UInt; justActive=false, UnionSret = false, AbstractIsMixed = false)
+    key = (ST, justActive, UnionSret, AbstractIsMixed)
+    if haskey(ActivityCache, key)
+        return ActivityCache[key]
+    end
+    set = Base.IdSet{Type}()
+    result = active_reg_inner(ST, set, world, justActive, UnionSret, AbstractIsMixed)
+    ActivityCache[key] = result
+    return result
+end
+
+function active_reg_nothrow end
+
+function active_reg_nothrow_generator(world::UInt, source::Union{Method, LineNumberNode}, T, self, _)
+    @nospecialize
+    result = active_reg(T, world)
+    check_activity_cache_invalidations(world)
+
+    slotnames = Core.svec(Symbol("#self#"), :T)
+    code = Any[Core.Compiler.ReturnNode(result)]
+    ci = create_fresh_codeinfo(active_reg_nothrow, source, world, slotnames, code)
+    
+    ci.edges = Any[]
+    for sig in ActivityHookSigs
+        add_edge!(ci.edges, sig)
+    end
+
+    return ci
+end
+
+@eval Base.@assume_effects :removable :foldable :nothrow @inline function active_reg_nothrow(::Type{T})::ActivityState where {T}
+    $(Expr(:meta, :generated_only))
+    $(Expr(:meta, :generated, active_reg_nothrow_generator))
+end
+
+Base.@assume_effects :removable :foldable :nothrow @inline function guaranteed_const(@nospecialize(T::Type))::Bool
+    rt = active_reg_nothrow(T)
     res = rt == AnyState
     return res
 end
 
-Base.@assume_effects :removable :foldable :nothrow @inline function guaranteed_const_nongen(::Type{T}, world)::Bool where {T}
-    rt = active_reg_inner(T, (), world)
+Base.@assume_effects :removable :foldable :nothrow @inline function guaranteed_const_nongen(@nospecialize(T::Type), world::UInt)::Bool
+    rt = active_reg(T, world)
     res = rt == AnyState
     return res
 end
 
 # check if a value is guaranteed to be not contain active[register] data
 # (aka not either mixed or active)
-Base.@assume_effects :removable :foldable :nothrow @inline function guaranteed_nonactive(::Type{T})::Bool where {T}
-    rt = Enzyme.Compiler.active_reg_nothrow(T, Val(nothing))
+Base.@assume_effects :removable :foldable :nothrow @inline function guaranteed_nonactive(@nospecialize(T::Type))::Bool
+    rt = active_reg_nothrow(T)
+    return rt == Enzyme.Compiler.AnyState || rt == Enzyme.Compiler.DupState
+end
+
+# check if a value is guaranteed to be not contain active[register] data
+# (aka not either mixed or active)
+@inline function guaranteed_nonactive(@nospecialize(T::Type), world::UInt; AbstractIsMixed=false)::Bool
+    rt = active_reg(T, world; justActive=true, AbstractIsMixed)
     return rt == Enzyme.Compiler.AnyState || rt == Enzyme.Compiler.DupState
 end
 
@@ -505,7 +530,7 @@ Base.@assume_effects :removable :foldable :nothrow @inline Enzyme.guess_activity
     guess_activity(T, convert(API.CDerivativeMode, mode))
 
 Base.@assume_effects :removable :foldable :nothrow @inline function Enzyme.guess_activity(::Type{T}, Mode::API.CDerivativeMode) where {T}
-    ActReg = active_reg_nothrow(T, Val(nothing))
+    ActReg = active_reg_nothrow(T)
     if ActReg == AnyState
         return Const{T}
     end

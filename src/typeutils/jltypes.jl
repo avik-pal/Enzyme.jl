@@ -1,5 +1,330 @@
 
+iszeroinit(Base.@nospecialize t) = (Base.@_total_meta; isa(t, DataType) && (t.flags & 0x0004) == 0x0004)
+
+@static if VERSION >= v"1.11"
+const datatype_layoutsize = Base.datatype_layoutsize
+else
+function datatype_layoutsize(dt::Base.DataType)
+    Base.@_foldable_meta
+    dt.layout == C_NULL && throw(Base.UndefRefError())
+    size = unsafe_load(convert(Ptr{Base.DataTypeLayout}, dt.layout)).size
+    return size % Int
+end
+end
+
+"""
+    mark_load_dereferenceable!(inst::LLVM.LoadInst, @nospecialize(source_typ), byref)
+
+Julia only marks a loaded pointer to a heap object as `dereferenceable` when
+it comes from a mutable struct's field; a field of an immutable struct gets no
+such metadata. Enzyme's `abs_typeof` knows the exact Julia type of the loaded
+value, so if `inst` loads a tracked pointer to an object of the concrete type
+`source_typ` (`byref == MUT_REF`), mark it `dereferenceable_or_null` for that
+type's size, as Julia's codegen does in the mutable case. Whether it is also
+non-null is left to Julia's own `nonnull`, which it emits exactly when the
+field cannot be `#undef`; with both, LLVM may speculate loads through the
+pointer, which lets LICM hoist e.g. an array's `Memory` pointer out of loops
+it is not guaranteed to be loaded in, where Enzyme otherwise has to cache it
+per iteration.
+"""
+function mark_load_dereferenceable!(inst::LLVM.LoadInst, @nospecialize(source_typ), byref)::Bool
+    byref == GPUCompiler.MUT_REF || return false
+    ty = value_type(inst)
+    (isa(ty, LLVM.PointerType) && addrspace(ty) == Tracked) || return false
+    (source_typ isa DataType && isconcretetype(source_typ) && !Base.issingletontype(source_typ)) || return false
+    source_typ.layout == C_NULL && return false
+    size = datatype_layoutsize(source_typ)
+    size > 0 || return false
+    metadata(inst)["dereferenceable_or_null"] = MDNode(LLVM.Metadata[LLVM.Metadata(LLVM.ConstantInt(Int64(size)))])
+    return true
+end
+
+"""
+    mark_loads_dereferenceable!(fn::LLVM.Function, enzyme_ctx)::Bool
+
+Apply `mark_load_dereferenceable!` to every load of a tracked pointer in `fn`
+whose Julia type `abs_typeof` can determine. Runs as a pass right before the
+loop passes of the early pipeline, since earlier passes recreate such loads
+without their metadata.
+"""
+function mark_loads_dereferenceable!(fn::LLVM.Function, enzyme_ctx::Union{EnzymeContext, Nothing})
+    T_jlvalue = LLVM.StructType(LLVMType[])
+    T_prjlvalue = LLVM.PointerType(T_jlvalue, Tracked)
+    changed = false
+    for bb in blocks(fn), inst in instructions(bb)
+        isa(inst, LLVM.LoadInst) || continue
+        value_type(inst) == T_prjlvalue || continue
+        (haskey(metadata(inst), "dereferenceable") || haskey(metadata(inst), "dereferenceable_or_null")) && continue
+        legal, source_typ, byref = abs_typeof(inst, enzyme_ctx)
+        legal || continue
+        changed |= mark_load_dereferenceable!(inst, source_typ, byref)
+    end
+    return changed
+end
+
+# On 1.12+, there was a change to the calling convention where
+# an additional argument would be added for the roots, this will
+# return the number of roots in the corresponding convention, or
+# 0 if it does not apply https://github.com/JuliaLang/julia/pull/55767/files#diff-62cfb2606c6a323a7f26a3eddfa0bf2b819fa33e094561fee09daeb328e3a1e7
+function inline_roots_type(@nospecialize(LT::LLVM.LLVMType))::Int
+   @static if VERSION <= v"1.12-"
+        return 0
+   else
+	   if !(LT isa LLVM.ArrayType || LT isa LLVM.StructType)
+		return 0
+	   end
+	   tracked = CountTrackedPointers(LT)
+	   if tracked.count > 0 && !tracked.all
+	       return Int(tracked.count)
+	   end
+	   return 0
+   end
+end
+
+function inline_roots_type(@nospecialize(T::Type))::Int
+   @static if VERSION <= v"1.12-"
+	return 0
+   else
+	   if T === Union{}
+		return 0
+	   end
+	   if GPUCompiler.deserves_argbox(T)
+		return 0
+	   end
+	   if Base.isabstracttype(T)
+		return 0
+	   end
+	   if isghostty(T) || Core.Compiler.isconstType(T)
+		return 0
+	   end
+	   LT = convert(LLVM.LLVMType, T)
+	   return inline_roots_type(LT)
+    end
+end
+
+function non_rooted_types(@nospecialize(typ::DataType))    
+    lRT = convert(LLVMType, typ)
+    tracked = CountTrackedPointers(lRT)
+    @assert !tracked.derived
+    @assert !tracked.all
+    @assert tracked.count != 0
+
+    inners = Type[]
+
+    todo = DataType[typ]
+    while length(todo) != 0
+        cur = popfirst!(todo)
+    
+        desc = Base.DataTypeFieldDesc(cur)
+         
+        next = DataType[]
+        for i in 1:fieldcount(cur)
+            styp = typed_fieldtype(cur, i)
+            if isghostty(styp)
+                push!(inners, styp)
+                continue
+            end
+            if desc[i].isptr
+                continue
+            end
+            if styp isa Union
+                push!(inners, styp)
+                continue
+            end
+            if !(styp isa DataType)
+                throw(AssertionError("Non inner datatype: styp=$styp cur=$cur, typ=$typ lRT=$(string(lRT))"))
+            end
+
+	    if fieldcount(styp) == 0
+		push!(inners, styp)
+	    else
+		push!(next, styp)
+	    end
+        end
+
+        for styp in reverse(next)
+            pushfirst!(todo, styp)
+        end
+    end
+    return inners
+end
+
+function equivalent_rooted_type(@nospecialize(typ::DataType))    
+    lRT = convert(LLVMType, typ)
+    tracked = CountTrackedPointers(lRT)
+    @assert !tracked.derived
+    @assert !tracked.all
+    @assert tracked.count != 0
+
+    inners = Type[]
+
+    todo = Tuple{Type, Bool}[(typ, false)]
+    while length(todo) != 0
+        cur, final = popfirst!(todo)
+        if final
+            push!(inners, cur)
+            continue
+        end
+    
+        desc = Base.DataTypeFieldDesc(cur)
+                
+        next = Tuple{Type,Bool}[]
+        for i in 1:fieldcount(cur)
+            styp = typed_fieldtype(cur, i)
+            if isghostty(styp)
+                continue
+            end
+            if desc[i].isptr
+                push!(next, (styp, true))
+                continue
+            end
+            if styp isa Union
+                continue
+            end
+            if !(styp isa DataType)
+                throw(AssertionError("Non inner datatype: styp=$styp cur=$cur, typ=$typ lRT=$(string(lRT))"))
+            end
+            push!(next, (styp, false))
+        end
+
+        for styp in reverse(next)
+            pushfirst!(todo, styp)
+        end
+    end
+
+    @assert length(inners) == tracked.count
+
+    res  = NamedTuple{ntuple(Symbol, Val(Int(tracked.count))),Tuple{inners...}}
+    res2 = AnyArray(Int(tracked.count))
+
+    @assert convert(LLVMType, res2) == convert(LLVMType, res)
+    return res
+end
+
+function tuple_non_rooted_types(@nospecialize(typ::DataType))
+    return Tuple(non_rooted_types(typ))
+end
+
+function tuple_rooted_types(@nospecialize(typ::DataType))
+    eq = equivalent_rooted_type(typ)
+    if eq <: NamedTuple && length(eq.parameters) >= 2
+        return Tuple(eq.parameters[2].parameters)
+    end
+    return ()
+end
+
 struct RemovedParam end
+
+function handle_param(args, codegen_types, @nospecialize(source_typ::Type), @nospecialize(rooted_typ::Union{Nothing, Type}), source_i::Int, orig_i::Int, arg_jl_i::Int, codegen_i::Int, last_cc, parmsRemoved, @nospecialize(source_sig::Type))
+    if isghostty(source_typ) || Core.Compiler.isconstType(source_typ)
+        push!(args, (cc = GPUCompiler.GHOST, typ = source_typ, arg_i = source_i,
+            rooted_typ = rooted_typ,
+            rooted_arg_i = rooted_typ === nothing ? nothing : (source_i - 1),
+            rooted_cc = rooted_typ === nothing ? nothing : last_cc,
+            arg_jl_i = arg_jl_i,
+        ))
+        last_cc = GPUCompiler.GHOST
+        return (orig_i, codegen_i, last_cc)
+    end
+
+    if in(orig_i - 1, parmsRemoved)
+        push!(args, (cc = RemovedParam, typ = source_typ, arg_i = source_i,
+			rooted_typ = rooted_typ,
+			rooted_arg_i = rooted_typ === nothing ? nothing : (source_i - 1),
+            rooted_cc = rooted_typ === nothing ? nothing : last_cc,
+			arg_jl_i = arg_jl_i,
+        ))
+        orig_i += 1
+	    last_cc = RemovedParam
+        return (orig_i, codegen_i, last_cc)
+    end
+
+    if codegen_i > length(codegen_types)
+        throw(AssertionError("codegen_i=$codegen_i > length(codegen_types)=$(length(codegen_types)) orig_i=$orig_i, last_cc=$last_cc source_typ=$source_typ rooted_typ=$rooted_typ arg_jl_i=$arg_jl_i parmsRemoved=$parmsRemoved"))
+    end
+
+    codegen_typ = codegen_types[codegen_i]
+
+    if codegen_typ isa LLVM.PointerType
+        llvm_source_typ = convert(LLVMType, source_typ; allow_boxed = true)
+        # pointers are used for multiple kinds of arguments
+        # - literal pointer values
+        if source_typ <: Ptr || source_typ <: Core.LLVMPtr
+            @assert llvm_source_typ == codegen_typ
+            push!(
+                args,
+                (
+                    cc = GPUCompiler.BITS_VALUE,
+                        typ = source_typ,
+                        arg_i = source_i,
+                        codegen = (typ = codegen_typ, i = codegen_i),
+			rooted_typ = rooted_typ,
+			rooted_arg_i = rooted_typ === nothing ? nothing : (source_i - 1),
+		        rooted_cc = rooted_typ === nothing ? nothing : last_cc,
+			arg_jl_i = arg_jl_i,
+                ),
+            )
+            # - boxed values
+            #   XXX: use `deserves_retbox` instead?
+		    last_cc = GPUCompiler.BITS_VALUE
+        elseif llvm_source_typ isa LLVM.PointerType
+            if llvm_source_typ != codegen_typ
+                throw(AssertionError("Mismatch codegen type llvm_source_typ=$(string(llvm_source_typ)) codegen_typ=$(string(codegen_typ)) source_i=$source_i source_sig=$source_sig, source_typ=$source_typ, codegen_i=$codegen_i, codegen_types=$(string(codegen_types))"))
+            end
+            push!(
+                args,
+                (
+                    cc = GPUCompiler.MUT_REF,
+                    typ = source_typ,
+                    arg_i = source_i,
+                    codegen = (typ = codegen_typ, i = codegen_i),
+                    rooted_typ = rooted_typ,
+                    rooted_arg_i = rooted_typ === nothing ? nothing : (source_i - 1),
+                    rooted_cc = rooted_typ === nothing ? nothing : last_cc,
+                    arg_jl_i = arg_jl_i,
+                ),
+            )
+            # - references to aggregates
+            last_cc = GPUCompiler.MUT_REF
+        else
+            @assert llvm_source_typ != codegen_typ
+            push!(
+                args,
+                (
+                    cc = GPUCompiler.BITS_REF,
+                    typ = source_typ,
+                    arg_i = source_i,
+                    codegen = (typ = codegen_typ, i = codegen_i),
+                    rooted_typ = rooted_typ,
+                    rooted_arg_i = rooted_typ === nothing ? nothing : (source_i - 1),
+                    rooted_cc = rooted_typ === nothing ? nothing : last_cc,
+                    arg_jl_i = arg_jl_i,
+                ),
+            )
+            last_cc = GPUCompiler.BITS_REF
+        end
+    else
+        push!(
+            args,
+            (
+                cc = GPUCompiler.BITS_VALUE,
+                typ = source_typ,
+                arg_i = source_i,
+                codegen = (typ = codegen_typ, i = codegen_i),
+                rooted_typ = rooted_typ,
+                rooted_arg_i = rooted_typ === nothing ? nothing : (source_i - 1),
+                rooted_cc = rooted_typ === nothing ? nothing : last_cc,
+                arg_jl_i = arg_jl_i,
+            ),
+        )
+        last_cc = GPUCompiler.BITS_VALUE
+    end
+
+    codegen_i += 1
+    orig_i += 1
+    
+    return (orig_i, codegen_i, last_cc)
+end
 
 # Modified from GPUCompiler classify_arguments
 function classify_arguments(
@@ -9,6 +334,8 @@ function classify_arguments(
     has_returnroots::Bool,
     has_swiftself::Bool,
     parmsRemoved::Vector{UInt64},
+    mi::Core.MethodInstance,
+    world::UInt,
 )
     codegen_types = parameters(codegen_ft)
 
@@ -33,75 +360,45 @@ function classify_arguments(
         end
         orig_i += 1
     end
-    for (source_i, source_typ) in enumerate(source_sig.parameters)
-        if isghostty(source_typ) || Core.Compiler.isconstType(source_typ)
-            push!(args, (cc = GPUCompiler.GHOST, typ = source_typ, arg_i = source_i))
-            continue
-        end
-        if in(orig_i - 1, parmsRemoved)
-            push!(args, (cc = RemovedParam, typ = source_typ))
-            orig_i += 1
-            continue
-        end
-        codegen_typ = codegen_types[codegen_i]
 
-        if codegen_typ isa LLVM.PointerType
-            llvm_source_typ = convert(LLVMType, source_typ; allow_boxed = true)
-            # pointers are used for multiple kinds of arguments
-            # - literal pointer values
-            if source_typ <: Ptr || source_typ <: Core.LLVMPtr
-                @assert llvm_source_typ == codegen_typ
-                push!(
-                    args,
-                    (
-                        cc = GPUCompiler.BITS_VALUE,
-                        typ = source_typ,
-                        arg_i = source_i,
-                        codegen = (typ = codegen_typ, i = codegen_i),
-                    ),
-                )
-                # - boxed values
-                #   XXX: use `deserves_retbox` instead?
-            elseif llvm_source_typ isa LLVM.PointerType
-                if llvm_source_typ != codegen_typ
-                    throw(AssertionError("Mismatch codegen type llvm_source_typ=$(string(llvm_source_typ)) codegen_typ=$(string(codegen_typ)) source_i=$source_i source_sig=$source_sig, source_typ=$source_typ, codegen_i=$codegen_i, codegen_types=$(string(codegen_ft))"))
-                end
-                push!(
-                    args,
-                    (
-                        cc = GPUCompiler.MUT_REF,
-                        typ = source_typ,
-                        arg_i = source_i,
-                        codegen = (typ = codegen_typ, i = codegen_i),
-                    ),
-                )
-                # - references to aggregates
-            else
-                @assert llvm_source_typ != codegen_typ
-                push!(
-                    args,
-                    (
-                        cc = GPUCompiler.BITS_REF,
-                        typ = source_typ,
-                        arg_i = source_i,
-                        codegen = (typ = codegen_typ, i = codegen_i),
-                    ),
-                )
+    last_cc = nothing
+    source_i = 0
+    for (arg_jl_i, source_typ) in enumerate(source_sig.parameters)
+        source_i += 1
+        rooted_typ = nothing
+        orig_i, codegen_i, last_cc = handle_param(args, codegen_types, source_typ, rooted_typ, source_i, orig_i, arg_jl_i, codegen_i, last_cc, parmsRemoved, source_sig)
+
+        roots = inline_roots_type(source_typ)
+        if roots != 0
+            byref = true
+            if last_cc == RemovedParam
+                # TODO(wmoses,vchuravy) if a parameter is removed, it is not possible to know if it was byref or not, we will assume it is byref for now.
+                # Note that getting this wrong can result in segfaults, invalid IR, or worse.
+                GPUCompiler.@safe_warn "TODO: Removed parameter with rooting cannot be known without calling convention. This is a bug which requires a fix in Julia (1.12+) itself"
+            elseif last_cc == GPUCompiler.BITS_VALUE
+                byref = false
             end
-        else
-            push!(
-                args,
-                (
-                    cc = GPUCompiler.BITS_VALUE,
-                    typ = source_typ,
-                    arg_i = source_i,
-                    codegen = (typ = codegen_typ, i = codegen_i),
-                ),
-            )
+            if byref
+                source_i += 1
+                rooted_typ = source_typ
+                source_typ = equivalent_rooted_type(source_typ)
+                orig_i, codegen_i, last_cc = handle_param(args, codegen_types, source_typ, rooted_typ, source_i, orig_i, arg_jl_i, codegen_i, last_cc, parmsRemoved, source_sig)
+            end
         end
+    end
 
-        codegen_i += 1
-        orig_i += 1
+    if codegen_i != length(codegen_types) + 1
+		msg = sprint() do io::IO
+		    println(io, "expectLen != length(parameters(f))")
+		    println(io, string(codegen_ft))
+		    println(io, "expectLen=", string(codegen_i-1))
+		    println(io, "has_swiftself=", string(has_swiftself))
+		    println(io, "has_sret=", string(has_sret))
+		    println(io, "has_returnroots=", string(has_returnroots))
+		    println(io, "source_sig=", string(source_sig))
+		    println(io, "parmsRemoved=", string(parmsRemoved))
+		end
+		throw(CallingConventionMismatchError{String}(msg, mi, world))
     end
 
     return args
@@ -138,6 +435,7 @@ function union_alloca_type(@nospecialize(UT::Type))
     for_each_uniontype_small(inner, UT)
     return nbytes
 end
+
 
 # From https://github.com/JuliaLang/julia/blob/e6bf81f39a202eedc7bd4f310c1ab60b5b86c251/src/codegen.cpp#L6447
 function is_sret(@nospecialize(jlrettype::Type))
@@ -210,7 +508,10 @@ function get_return_info(
         else
             rt = Any
         end
-    elseif jlrettype <: Tuple && in(Any, jlrettype.parameters)
+    elseif jlrettype <: Tuple && (!isa(jlrettype, DataType) || in(Any, jlrettype.parameters))
+        # A tuple that is not fully concrete (a UnionAll such as
+        # `Tuple{Vararg{Any, N}} where N`, or one with an `Any` element) is
+        # returned boxed.
         rt = Any
     elseif !GPUCompiler.deserves_retbox(jlrettype)
         lRT = convert(LLVMType, jlrettype)
@@ -255,6 +556,7 @@ end
 @inline any_jltypes(::Type{Nothing}) = false
 @inline any_jltypes(::Type{T}) where {T<:AbstractFloat} = false
 @inline any_jltypes(::Type{T}) where {T<:Integer} = false
+@inline any_jltypes(::Type{T}) where {T<:Enum} = false
 @inline any_jltypes(::Type{Complex{T}}) where {T} = any_jltypes(T)
 @inline any_jltypes(::Type{Tuple{}}) = false
 @inline any_jltypes(::Type{NTuple{Size,T}}) where {Size,T} = any_jltypes(T)
@@ -297,3 +599,15 @@ end
 @inline remove_innerty(::Type{<:BatchDuplicatedNoNeed}) = DuplicatedNoNeed
 @inline remove_innerty(::Type{<:MixedDuplicated}) = MixedDuplicated
 @inline remove_innerty(::Type{<:BatchMixedDuplicated}) = MixedDuplicated
+
+@inline function is_memory_instance(@nospecialize(obj))
+   @static if VERSION < v"1.11"
+	return false
+   else
+	if obj isa Memory
+	   return obj == typeof(obj).instance
+        end
+	return false
+   end
+end
+
