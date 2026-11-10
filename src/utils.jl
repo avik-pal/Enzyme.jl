@@ -5,41 +5,52 @@
     Assumes that `val` is globally rooted and pointer to it can be leaked. Prefer `pointer_from_objref`.
     Only use inside Enzyme.jl should be for Types.
 """
-@inline unsafe_to_pointer(@nospecialize(val::Type)) = @static if sizeof(Int) == sizeof(Int64)
-    Base.llvmcall((
-"""
-declare nonnull {}* @julia.pointer_from_objref({} addrspace(11)*)
+function unsafe_to_pointer end
+export unsafe_to_pointer
 
-define i64 @f({} addrspace(10)* %obj) readnone alwaysinline {
-  %c = addrspacecast {} addrspace(10)* %obj to {} addrspace(11)*
-  %r = call {}* @julia.pointer_from_objref({} addrspace(11)* %c)
-  %e = ptrtoint {}* %r to i64
-  ret i64 %e
-}
-""", "f"),
-    Ptr{Cvoid},
-    Tuple{Any},
-    val,
-)
+if VERSION >= v"1.12-"
+    @inline function unsafe_to_pointer(@nospecialize(val::Type))
+        return Core.Intrinsics.llvmcall((
+            """
+            declare nonnull ptr @julia.pointer_from_objref(ptr addrspace(11))
+
+            define ptr @f(ptr addrspace(10) %obj) readnone alwaysinline {
+                %c = addrspacecast ptr addrspace(10) %obj to ptr addrspace(11)
+                %r = call ptr @julia.pointer_from_objref(ptr addrspace(11) %c)
+                ret ptr %r
+            }
+            """, "f"), Ptr{Cvoid}, Tuple{Any}, val)
+    end
+elseif Int == Int64
+    @inline function unsafe_to_pointer(@nospecialize(val::Type))
+        return Base.llvmcall((
+            """
+            declare nonnull {}* @julia.pointer_from_objref({} addrspace(11)*)
+
+            define i64 @f({} addrspace(10)* %obj) readnone alwaysinline {
+                %c = addrspacecast {} addrspace(10)* %obj to {} addrspace(11)*
+                %r = call {}* @julia.pointer_from_objref({} addrspace(11)* %c)
+                %e = ptrtoint {}* %r to i64
+                ret i64 %e
+            }
+            """, "f"), Ptr{Cvoid}, Tuple{Any}, val)
+    end
 else
-    Base.llvmcall((
-"""
-declare nonnull {}* @julia.pointer_from_objref({} addrspace(11)*)
+    @inline function unsafe_to_pointer(@nospecialize(val::Type))
+        return Base.llvmcall((
+            """
+            declare nonnull {}* @julia.pointer_from_objref({} addrspace(11)*)
 
-define i32 @f({} addrspace(10)* %obj) readnone alwaysinline {
-  %c = addrspacecast {} addrspace(10)* %obj to {} addrspace(11)*
-  %r = call {}* @julia.pointer_from_objref({} addrspace(11)* %c)
-  %e = ptrtoint {}* %r to i32
-  ret i32 %e
-}
-""", "f"),
-    Ptr{Cvoid},
-    Tuple{Any},
-    val,
-)
+            define i32 @f({} addrspace(10)* %obj) readnone alwaysinline {
+                %c = addrspacecast {} addrspace(10)* %obj to {} addrspace(11)*
+                %r = call {}* @julia.pointer_from_objref({} addrspace(11)* %c)
+                %e = ptrtoint {}* %r to i32
+                ret i32 %e
+            }
+            """, "f"), Ptr{Cvoid}, Tuple{Any}, val)
+    end
 end
 
-export unsafe_to_pointer
 
 @inline is_concrete_tuple(x::Type{T2}) where {T2} =
     (T2 <: Tuple) && !(T2 === Tuple) && !(T2 isa UnionAll)
@@ -50,6 +61,12 @@ const Derived = 11
 export Tracked, Derived
 
 const captured_constants = Base.IdSet{Any}()
+
+function arg_operands_view(inst::LLVM.CallInst)
+    N_args = LLVM.API.LLVMGetNumArgOperands(inst)
+    return @view LLVM.operands(inst)[1:N_args]
+end
+
 
 function unsafe_nothing_to_llvm(mod::LLVM.Module)
     globs = LLVM.globals(mod)
@@ -80,53 +97,114 @@ function unsafe_to_ptr(@nospecialize(val))
 end
 export unsafe_to_ptr
 
+# Record `val` in the table of the compilation `ctx` and return its key, `inserted$<hint>$<id>`;
+# the global `ejl_<key>` then stands for `val`. The table leaves the compilation with the module
+# (`julia_value_table`), and whoever links the module resolves the name: `_thunk` as it hands the
+# module to the JIT, the compilation a host derivative is linked into, or the job a device
+# derivative is handed to. The key names the object by its `objectid` rather than by its
+# address, so it is the same in every session and leaves the address to the resolver. The
+# context roots the values, which keeps their `objectid` unique; should two values still hash
+# alike, the later one gets a suffix.
+function insert_julia_value!(ctx::EnzymeContext, hint::String, @nospecialize(val))::String
+    inserted = ctx.inserted_values
+    base = "inserted\$" * hint * "\$" * string(objectid(val); base = 16)
+    k = base
+    n = 1
+    while true
+        if !haskey(inserted, k)
+            inserted[k] = val
+            return k
+        elseif inserted[k] === val
+            return k
+        end
+        n += 1
+        k = base * "\$" * string(n)
+    end
+    return
+end
+
+# Create (or fetch) the `ejl_<k>` global that stands for the Julia object `val` in the module
+# `B` is positioned in. Top-level and `@nospecialize`d on purpose: as a closure inside
+# `unsafe_to_llvm` this captured `val`, so the closure type embedded `typeof(val)` and a fresh
+# specialization (~20 ms of compile) was needed for every distinct global object ever emitted.
+function setup_global(
+        B::LLVM.IRBuilder,
+        T_jlvalue::LLVM.StructType,
+        world::Union{UInt, Nothing},
+        insert_name_if_not_exists::Union{String, Nothing},
+        k::String,
+        @nospecialize(val),
+        enzyme_ctx::Union{EnzymeContext, Nothing},
+    )::LLVM.Value
+    mod = LLVM.parent(LLVM.parent(LLVM.position(B)))
+    globs = LLVM.globals(mod)
+    if Base.haskey(globs, "ejl_" * k)
+        return globs["ejl_" * k]
+    end
+
+    force_inactive = false
+    if insert_name_if_not_exists isa String
+        # The value goes in the table of the compilation the module belongs to.
+        enzyme_ctx === nothing && throw(AssertionError("Inserting the Julia value $val needs the context of the compilation"))
+        k = insert_julia_value!(enzyme_ctx, insert_name_if_not_exists, val)
+        # Since the legacy behavior was to force inactive for global constants, we retain that here (for now)
+        force_inactive = true
+    end
+
+    if Base.haskey(globs, "ejl_" * k)
+        return globs["ejl_" * k]
+    end
+
+    gv = LLVM.GlobalVariable(mod, T_jlvalue, "ejl_" * k, Tracked)
+
+    API.SetMD(gv, "enzyme_ta_norecur", LLVM.MDNode(LLVM.Metadata[]))
+    empty_memory = Enzyme.Compiler.is_memory_instance(val)
+    if empty_memory
+        # The empty Memory singleton: no in-bounds access writes its data, so Enzyme may treat
+        # writes through a Memory that is either it or freshly allocated as local writes.
+        API.SetMD(gv, "enzymejl_empty_memory", LLVM.MDNode(LLVM.Metadata[]))
+    end
+    inactive = force_inactive || empty_memory
+    if !inactive && val isa Core.SimpleVector && length(val) == 0
+        inactive = true
+    end
+    if !inactive && world isa UInt
+        legal, jTy, byref = Compiler.abs_typeof(gv, enzyme_ctx, true)
+        if legal
+            state = Enzyme.Compiler.active_reg(jTy, world)
+            inactive = state == Enzyme.Compiler.AnyState || state == Enzyme.Compiler.ActiveState
+        end
+    end
+    if inactive
+        API.SetMD(gv, "enzyme_inactive", LLVM.MDNode(LLVM.Metadata[]))
+    end
+    return gv
+end
+
 # This mimicks literal_pointer_val / literal_pointer_val_slot
-function unsafe_to_llvm(B::LLVM.IRBuilder, @nospecialize(val))::LLVM.Value
+# `insert_name_if_not_exists` puts `val` in the table of the compilation `enzyme_ctx` under a
+# name, which the code then refers to (see `insert_julia_value!`).
+function unsafe_to_llvm(B::LLVM.IRBuilder, @nospecialize(val); insert_name_if_not_exists::Union{String, Nothing} = nothing, enzyme_ctx::Union{EnzymeContext, Nothing} = nothing)::LLVM.Value
     T_jlvalue = LLVM.StructType(LLVM.LLVMType[])
     T_prjlvalue = LLVM.PointerType(T_jlvalue, Tracked)
     T_prjlvalue_UT = LLVM.PointerType(T_jlvalue)
 
+    world = enzyme_world_if_active()
+
     for (k, v) in Compiler.JuliaGlobalNameMap
         if v === val
-            mod = LLVM.parent(LLVM.parent(LLVM.position(B)))
-            globs = LLVM.globals(mod)
-            if Base.haskey(globs, "ejl_" * k)
-                return globs["ejl_"*k]
-            end
-            gv = LLVM.GlobalVariable(mod, T_jlvalue, "ejl_" * k, Tracked)
-
-            API.SetMD(gv, "enzyme_ta_norecur", LLVM.MDNode(LLVM.Metadata[]))
-            legal, jTy, byref = Compiler.abs_typeof(gv, true)
-            if legal
-                curent_bb = position(B)
-                fn = LLVM.parent(curent_bb)
-                if Compiler.guaranteed_const_nongen(jTy, nothing)
-                    API.SetMD(gv, "enzyme_inactive", LLVM.MDNode(LLVM.Metadata[]))
-                end
-            end
-            return gv
+            return setup_global(B, T_jlvalue, world, insert_name_if_not_exists, k, val, enzyme_ctx)
         end
     end
 
     for (k, v) in Compiler.JuliaEnzymeNameMap
         if v === val
-            mod = LLVM.parent(LLVM.parent(LLVM.position(B)))
-            globs = LLVM.globals(mod)
-            if Base.haskey(globs, "ejl_" * k)
-                return globs["ejl_"*k]
-            end
-            gv = LLVM.GlobalVariable(mod, T_jlvalue, "ejl_" * k, Tracked)
-            API.SetMD(gv, "enzyme_ta_norecur", LLVM.MDNode(LLVM.Metadata[]))
-            legal, jTy, byref = Compiler.abs_typeof(gv, true)
-            if legal
-                curent_bb = position(B)
-                fn = LLVM.parent(curent_bb)
-                if Compiler.guaranteed_const_nongen(jTy, nothing)
-                    API.SetMD(gv, "enzyme_inactive", LLVM.MDNode(LLVM.Metadata[]))
-                end
-            end
-            return gv
+            return setup_global(B, T_jlvalue, world, insert_name_if_not_exists, k, val, enzyme_ctx)
         end
+    end
+
+    if insert_name_if_not_exists !== nothing
+        return setup_global(B, T_jlvalue, world, insert_name_if_not_exists, insert_name_if_not_exists, val, enzyme_ctx)
     end
 
     # XXX: This prevents code from being runtime relocatable
@@ -164,7 +242,7 @@ import Base: allocatedinline
 
 using Core: MethodInstance
 using GPUCompiler: tls_world_age, MethodError, methodinstance
-using Core.Compiler: retrieve_code_info, CodeInfo, SSAValue, ReturnNode
+using Core.Compiler: CodeInfo, SSAValue, ReturnNode
 using Base: _methods_by_ftype
 
 # Julia compiler integration
@@ -238,6 +316,67 @@ end
     end
 end
 
+
+"""
+    create_fresh_codeinfo(fn, source, world)
+
+Create a fresh `Core.CodeInfo` for a generated function `fn` with source location `source` and world age `world`.
+Callers are responsible for setting `ci.edges`
+"""
+function create_fresh_codeinfo(fn, source, world, slotnames, code)
+    ci = ccall(:jl_new_code_info_uninit, Ref{Core.CodeInfo}, ())
+    
+    @static if isdefined(Core, :DebugInfo)
+        # TODO: Add proper debug info
+        ci.debuginfo = Core.DebugInfo(:none)
+    else
+        ci.codelocs = Int32[]
+        ci.linetable = [
+            Core.Compiler.LineInfoNode(@__MODULE__, fn, source.file, Int32(source.line), Int32(0))
+        ]
+    end
+
+    ci.min_world = world
+    ci.max_world = typemax(UInt)
+
+    ci.slotnames = Symbol[sym for sym in slotnames]
+    ci.slotflags = UInt8[0x00 for i = 1:length(slotnames)]
+    if VERSION >= v"1.12-"
+        ci.nargs = length(slotnames)
+        ci.isva = false
+    end
+
+    ci.code = code
+    ci.ssaflags = UInt8[0x00 for i = 1:length(code)]   # Julia's native compilation pipeline (and its verifier) expects `ssaflags` to be the same length as `code`
+    @static if isdefined(Core, :DebugInfo)
+    else
+        for _ in 1:length(code)
+            push!(ci.codelocs, 1)   # all instructions map to the first line
+        end
+    end
+
+    ci.ssavaluetypes = length(code)
+
+    return ci
+end
+
+function add_edge!(edges::Vector{Any}, @nospecialize(invoke_sig::Type))
+    mt = ccall(:jl_method_table_for, Any, (Any,), invoke_sig)
+    if VERSION < v"1.12-"
+        push!(edges, mt)
+        push!(edges, invoke_sig)
+    else
+        push!(edges, invoke_sig)
+        push!(edges, mt)
+    end
+    return edges
+end
+
+function add_edge!(edges::Vector{Any}, mi::Core.MethodInstance)
+    push!(edges, mi)
+    return edges
+end
+
 @inline function my_methodinstance(@nospecialize(method_table::Union{Core.Compiler.MethodTableView, Nothing}), @nospecialize(ft::Type), @nospecialize(tt::Type), world::UInt, min_world::Union{Nothing, Base.RefValue{UInt}}=nothing, max_world::Union{Nothing, Base.RefValue{UInt}}=nothing)::Union{Core.MethodInstance, Nothing}
 
     if min_world === nothing
@@ -267,9 +406,9 @@ end
     my_methodinstance(Core.Compiler.method_table(interp), ft, tt, interp.world, min_world, max_world)
 end
 
-@inline function my_methodinstance(@nospecialize(mode::Union{EnzymeCore.ForwardMode, EnzymeCore.ReverseMode}), @nospecialize(ft::Type), @nospecialize(tt::Type), world::UInt, min_world::Union{Nothing, Base.RefValue{UInt}}=nothing, max_world::Union{Nothing, Base.RefValue{UInt}}=nothing)::Union{Core.MethodInstance, Nothing}
-    interp = if mode === Nothing
-        Base.NativeInterpreter(; world)
+@inline function my_methodinstance(@nospecialize(mode::Union{Missing, EnzymeCore.ForwardMode, EnzymeCore.ReverseMode}), @nospecialize(ft::Type), @nospecialize(tt::Type), world::UInt, min_world::Union{Nothing, Base.RefValue{UInt}}=nothing, max_world::Union{Nothing, Base.RefValue{UInt}}=nothing)::Union{Core.MethodInstance, Nothing}
+    interp = if mode === missing # TODO: PrimalMode
+        Core.Compiler.NativeInterpreter(world)
     else
         @assert mode == Forward || mode == Reverse
         Compiler.primal_interp_world(mode, world)
@@ -277,50 +416,33 @@ end
     my_methodinstance(interp, ft, tt, min_world, max_world)
 end
 
+function prevmethodinstance end
+
 function methodinstance_generator(world::UInt, source, self, @nospecialize(mode::Type), @nospecialize(ft::Type), @nospecialize(tt::Type))
     @nospecialize
     @assert Core.Compiler.isType(ft) && Core.Compiler.isType(tt)
     ft = ft.parameters[1]
     tt = tt.parameters[1]
 
-    stub = Core.GeneratedFunctionStub(identity, Core.svec(:methodinstance, :mode, :ft, :tt), Core.svec())
+    slotnames = Core.svec(Symbol("#self#"), :mode, :ft, :tt)
+    stub = Core.GeneratedFunctionStub(identity, slotnames, Core.svec())
 
     # look up the method match
-    method_error = :(throw(MethodError(ft, tt, $world)))
     min_world = Ref{UInt}(typemin(UInt))
     max_world = Ref{UInt}(typemax(UInt))
-
     mi = my_methodinstance(mode.instance, ft, tt, world, min_world, max_world)
     
-    mi === nothing && return stub(world, source, method_error)
+    mi === nothing && return stub(world, source, :(throw(MethodError(ft, tt, $world))))
     
-    ci = Core.Compiler.retrieve_code_info(mi, world)
+    code = Any[Core.Compiler.ReturnNode(mi)]
 
-    # prepare a new code info
-    new_ci = copy(ci)
-    empty!(new_ci.code)
-    empty!(new_ci.codelocs)
-    empty!(new_ci.linetable)
-    empty!(new_ci.ssaflags)
-    new_ci.ssavaluetypes = 0
+    ci = create_fresh_codeinfo(prevmethodinstance, source, world, slotnames, code)
+    ci.min_world = min_world[]
+    ci.max_world = max_world[]
+    ci.edges = Any[mi]
 
-    # propagate edge metadata
-    new_ci.min_world = min_world[]
-    new_ci.max_world = max_world[]
-    new_ci.edges = MethodInstance[mi]
-
-    # prepare the slots
-    new_ci.slotnames = Symbol[Symbol("#self#"), :mode, :ft, :tt]
-    new_ci.slotflags = UInt8[0x00 for i = 1:4]
-
-    # return the method instance
-    push!(new_ci.code, Core.Compiler.ReturnNode(mi))
-    push!(new_ci.ssaflags, 0x00)
-    push!(new_ci.linetable, GPUCompiler.@LineInfoNode(methodinstance))
-    push!(new_ci.codelocs, 1)
-    new_ci.ssavaluetypes += 1
-
-    return new_ci
+    # TODO: Missing edge handling
+    return ci
 end
 
 @eval function prevmethodinstance(mode, ft, tt)::Core.MethodInstance
@@ -393,10 +515,23 @@ end
 
 else
 
+function is_memory_ref_field2_an_offset(@nospecialize(T::Type{<:GenericMemoryRef}))
+    ET = eltype(T)
+
+    # 0 = inlinealloc
+    # 1 = isboxed
+    # 2 = isbitsunion
+    return (Base.datatype_arrayelem(T.types[2]) == 2) || Compiler.datatype_layoutsize(T.types[2]) == 0
+end
+
 @inline function typed_fieldtype(@nospecialize(T::Type), i::Int)::Type
     if T <: GenericMemoryRef && i == 1 || T <: GenericMemory && i == 2
-        eT = eltype(T)
-        Ptr{eT}
+        if T <: GenericMemoryRef && i == 1 && T isa DataType && is_memory_ref_field2_an_offset(T)
+            Int
+        else
+            eT = eltype(T)
+            Ptr{eT}
+        end
     else
         fieldtype(T, i)
     end
@@ -417,11 +552,125 @@ export typed_fieldcount
 export typed_fieldoffset
 
 # returns the inner type of an sret/enzyme_sret/enzyme_sret_v
-function sret_ty(fn::LLVM.Function, idx::Int)::LLVM.LLVMType
-    return eltype(LLVM.value_type(LLVM.parameters(fn)[idx]))
+function sret_ty(fn::LLVM.Function, idx::Int, btval::Union{Nothing, LLVM.Instruction}=nothing, throw_error=true)::Union{Nothing, LLVM.LLVMType}
+
+    vt = LLVM.value_type(LLVM.parameters(fn)[idx])
+
+    sretkind = LLVM.kind(if LLVM.version().major >= 12
+        LLVM.TypeAttribute("sret", LLVM.Int32Type())
+    else
+        LLVM.EnumAttribute("sret")
+    end)
+
+
+    enzymejl_parmtype_ref = nothing
+    enzymejl_parmtype = nothing
+
+    for attr in collect(LLVM.parameter_attributes(fn, idx))
+        ekind = LLVM.kind(attr)
+
+        if ekind == sretkind
+            res = LLVM.value(attr)
+            if !LLVM.is_opaque(vt)
+                @assert eltype(vt) == res
+            end
+            return res::LLVM.LLVMType
+        end
+
+        if ekind == "enzymejl_sret_union_bytes"
+            nbytes = parse(Int, LLVM.value(attr))
+            i8 = LLVM.IntType(8)
+
+            res = LLVM.ArrayType(i8, nbytes)
+            if !LLVM.is_opaque(vt)
+                @assert eltype(vt) == res
+            end
+            return res::LLVM.LLVMType
+        end
+
+        if ekind == "enzymejl_returnRoots"
+            nroots = parse(Int, LLVM.value(attr))
+    
+            T_jlvalue = LLVM.StructType(LLVM.LLVMType[])
+            T_prjlvalue = LLVM.PointerType(T_jlvalue, Tracked)
+
+            res = LLVM.ArrayType(T_prjlvalue, nroots)
+            if !LLVM.is_opaque(vt)
+                @assert eltype(vt) == res
+            end
+            return res::LLVM.LLVMType
+        end
+
+        if ekind == "enzyme_sret"
+            ety = parse(UInt, LLVM.value(attr))
+            ety = Base.reinterpret(LLVM.API.LLVMTypeRef, ety)
+            ety = LLVM.LLVMType(ety)
+            if !LLVM.is_opaque(vt)
+                @assert ety == eltype(vt) "Mismatched sret type $(string(fn))\nidx=$idx\nety ($(string(ety))) != eltype(vt) (vt = $(string(vt)))"
+            end
+        
+            return ety::LLVM.LLVMType
+        end
+
+        if ekind == "enzymejl_parmtype_ref"
+            enzymejl_parmtype_ref = GPUCompiler.ArgumentCC(parse(UInt, LLVM.value(attr)))
+            continue
+        end
+
+        if ekind == "enzymejl_parmtype"
+            ptr = reinterpret(Ptr{Cvoid}, parse(UInt, LLVM.value(attr)))
+            enzymejl_parmtype = Base.unsafe_pointer_to_objref(ptr)::Type
+        end
+    end
+
+    if enzymejl_parmtype_ref == GPUCompiler.BITS_REF && enzymejl_parmtype !== nothing
+        res = convert(LLVM.LLVMType, enzymejl_parmtype)
+        if !LLVM.is_opaque(vt)
+            @assert eltype(vt) == res
+        end
+        return res::LLVM.LLVMType
+    end
+
+
+    if !throw_error
+        return nothing
+    end
+
+    mi, _ = Compiler.enzyme_custom_extract_mi(
+        fn,
+        false,
+    ) #=error=#
+    world = enzyme_world_if_active()
+
+    msg = "Function requesting sret type was not an sret\n\nidx=$idx\nenzymejl_parmtype=$enzymejl_parmtype enzymejl_parmtype_ref=$enzymejl_parmtype_ref\n"
+    ir = string(fn)
+    bt = nothing
+    if btval !== nothing        
+        bt = GPUCompiler.backtrace(btval)
+    end
+    if mi !== nothing && world !== nothing
+        throw(Compiler.EnzymeInternalError{Core.MethodInstance, UInt}(msg, ir, bt, mi, world))
+    else
+        throw(Compiler.EnzymeInternalError{Nothing, Nothing}(msg, ir, bt, nothing, nothing))
+    end
 end
 
 export sret_ty
+
+function get_rooted_typ(fn::LLVM.Function, idx::Int)::LLVM.LLVMType
+    for attr in collect(LLVM.parameter_attributes(fn, idx))
+        ekind = LLVM.kind(attr)
+
+        if ekind == "enzymejl_rooted_typ"
+            ptr = reinterpret(Ptr{Cvoid}, parse(UInt, LLVM.value(attr)))
+            return Base.unsafe_pointer_to_objref(ptr)
+        end
+    end
+
+    throw(AssertionError("Function requesting rooted type was not an sret\nidx=$idx\nfn=$(string(fn))"))
+end
+
+export get_rooted_typ
 
 function remove_nothing_from_union_type(@nospecialize(T::Type))::Type
     if T isa Union

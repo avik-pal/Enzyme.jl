@@ -2,10 +2,7 @@ import LLVM: refcheck
 
 LLVM.@checked struct Logic
     ref::API.EnzymeLogicRef
-    function Logic()
-        ref = API.CreateLogic()
-        new(ref)
-    end
+    Logic() = new(API.CreateLogic())
 end
 Base.unsafe_convert(::Type{API.EnzymeLogicRef}, logic::Logic) = logic.ref
 LLVM.dispose(logic::Logic) = API.FreeLogic(logic)

@@ -39,6 +39,7 @@ additional constraints:
 - `rtol`: Relative tolerance for `isapprox`.
 - `atol`: Absolute tolerance for `isapprox`.
 - `testset_name`: Name to use for a testset in which all tests are evaluated.
+- `output_tangent`: Optional final tangent to provide at the beginning of the reverse-mode differentiation 
 
 # Examples
 
@@ -57,8 +58,6 @@ end
 
 Here we test a rule for a function of an array in batch reverse-mode:
 
-
-
 ```julia
 x = randn(3)
 for Tret in (Const, Active), Tx in (Const, BatchDuplicated)
@@ -76,28 +75,28 @@ function test_reverse(
     rtol::Real=1e-9,
     atol::Real=1e-9,
     testset_name=nothing,
-    runtime_activity::Bool=false
-)
-    call_with_captured_kwargs(f, xs...) = f(xs...; fkwargs...)
+    runtime_activity::Bool=false,
+    output_tangent=nothing)
+    call_with_captured_kwargs = CallWithKWargs(fkwargs)
     if testset_name === nothing
         testset_name = "test_reverse: $f with return activity $ret_activity on $(_string_activity(args))"
     end
     @testset "$testset_name" begin
         # format arguments for autodiff and FiniteDifferences
         activities = map(Base.Fix1(auto_activity, rng), (f, args...))
-        primals = map(x -> x.val, activities)
+        primals = map(get_primal, activities)
         # call primal, avoid mutating original arguments
         fcopy = deepcopy(first(primals))
         args_copy = deepcopy(Base.tail(primals))
         y = fcopy(args_copy...; deepcopy(fkwargs)...)
         # generate tangent for output
         if !_any_batch_duplicated(ret_activity, map(typeof, activities)...)
-            ȳ = ret_activity <: Const ? zero_tangent(y) : rand_tangent(rng, y)
+            ȳ = isnothing(output_tangent) ? (ret_activity <: Const ? zero_tangent(y) : rand_tangent(rng, y)) : output_tangent
         else
             batch_size = _batch_size(ret_activity, map(typeof, activities)...)
             ks = ntuple(Symbol ∘ string, batch_size)
             ȳ = ntuple(batch_size) do _
-                return ret_activity <: Const ? zero_tangent(y) : rand_tangent(y)
+                return isnothing(output_tangent) ? (ret_activity <: Const ? zero_tangent(y) : rand_tangent(rng, y)) : copy(output_tangent)
             end
         end
         # call finitedifferences, avoid mutating original arguments

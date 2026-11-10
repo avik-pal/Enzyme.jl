@@ -53,6 +53,7 @@ import EnzymeCore:
     set_strong_zero,
     clear_strong_zero,
     within_autodiff,
+    ignore_derivatives,
     WithPrimal,
     NoPrimal,
     needs_primal,
@@ -123,6 +124,7 @@ export EnzymeRules
 include("pmap.jl")
 
 import LLVM
+using ScopedValues: ScopedValue, @with
 include("api.jl")
 
 Base.convert(::Type{API.CDerivativeMode}, ::ReverseMode) = API.DEM_ReverseModeCombined
@@ -131,18 +133,121 @@ Base.convert(::Type{API.CDerivativeMode}, ::ForwardMode) = API.DEM_ForwardMode
 
 function guess_activity end
 
+"""
+    EnzymeContext
+
+The state one differentiation of one module accumulates: the modules
+`nested_codegen!` emitted and has yet to link, the edges the resulting
+`CodeInstance` must depend on, the cache of already emitted nested
+functions, the cached thunks already imported into one of those modules, and
+the Julia values the module's global slots refer to and their addresses
+(`julia_values` and `julia_slot_addrs`, keyed by the name of the slot; see
+`Compiler.record_julia_values!`), and the Julia values Enzyme refers to by name
+from the code it generates (`inserted_values`, keyed by the name of the `ejl_`
+global without the prefix; see `insert_julia_value!`). On GPUCompiler 2.x the
+values of the slots are read straight from the relocation records of the
+modules the compilation emitted (`relocations`), and `bakes` says whether the
+back-end lets their host addresses into the code.
+
+A context belongs to a single `compile_unhooked` invocation, and holds the
+world age that compilation runs in. It is not passed as an argument:
+`compile_unhooked` binds it to the [`ENZYME_CONTEXT`](@ref) scoped value for
+the duration of the compilation, and everything running under it -- the rule
+handlers Enzyme calls back into, in particular -- reaches it with
+[`enzyme_context`](@ref) and [`enzyme_world`](@ref). A nested compilation binds
+its own context, which the outer one gets back when the nested compilation
+returns.
+"""
+mutable struct EnzymeContext
+    world::UInt
+    modules_to_link::Vector{LLVM.Module}
+    edges::Vector{Any}
+    nested_cache::Dict{Core.MethodInstance, String}
+    imported_thunks::Dict{Ptr{Cvoid}, String}
+    julia_values::Dict{String, Any}
+    julia_slot_addrs::Dict{String, Ptr{Cvoid}}
+    inserted_values::Dict{String, Any}
+    relocations::Vector{Any}
+    bakes::Bool
+    EnzymeContext(world::Integer) = new(
+        world,
+        LLVM.Module[],
+        Any[],
+        Dict{Core.MethodInstance, String}(),
+        Dict{Ptr{Cvoid}, String}(),
+        Dict{String, Any}(),
+        Dict{String, Ptr{Cvoid}}(),
+        Dict{String, Any}(),
+        Any[],
+        true
+    )
+end
+
+"""
+    ENZYME_CONTEXT
+
+The [`EnzymeContext`](@ref) of the compilation running in the current dynamic
+scope. Bound by `compile_unhooked`; read with [`enzyme_context`](@ref).
+"""
+const ENZYME_CONTEXT = ScopedValue{EnzymeContext}()
+
+"""
+    enzyme_context()
+
+Return the [`EnzymeContext`](@ref) of the compilation running in the current
+dynamic scope. It is an error to call this outside of a compilation.
+"""
+function enzyme_context()
+    if !isassigned(ENZYME_CONTEXT)
+        error("Enzyme: no EnzymeContext is active; this must be called during a compilation")
+    end
+    return ENZYME_CONTEXT[]
+end
+
+"""
+    enzyme_world()
+
+The world age the compilation running in the current dynamic scope was entered
+with, that is, the world every method lookup Enzyme makes for it must use. It
+is an error to call this outside of a compilation.
+"""
+enzyme_world()::UInt = enzyme_context().world
+
+"""
+    enzyme_world_if_active()
+
+[`enzyme_world`](@ref), or `nothing` when no compilation is running in the
+current dynamic scope. For code that must not fail when it cannot find a world,
+such as the construction of an error message, and for the LLVM passes that run
+after a compilation has already returned its module.
+"""
+function enzyme_world_if_active()::Union{Nothing, UInt}
+    isassigned(ENZYME_CONTEXT) || return nothing
+    return ENZYME_CONTEXT[].world
+end
+
 include("logic.jl")
 include("analyses/type.jl")
 include("typetree.jl")
 include("gradientutils.jl")
 include("utils.jl")
 include("compiler.jl")
-include("internal_rules.jl")
+include("internal_rules/core.jl")
+include("internal_rules/inactive.jl")
+include("internal_rules/linalg.jl")
+include("internal_rules/ranges.jl")
+include("internal_rules/sorting.jl")
+include("internal_rules/bigfloat.jl")
+include("internal_rules/rand.jl")
+include("internal_rules/math.jl")
 
 import .Compiler: CompilationException
 
 @inline function falses_from_args(N)
     ntuple(Returns(false), Val(N))
+end
+@inline function trues_from_args(N)
+    ntuple(Returns(true), Val(N))
 end
 
 @inline function any_active(args::Vararg{Annotation,N}) where {N}
@@ -402,7 +507,7 @@ Enzyme.autodiff(ReverseWithPrimal, x->x*x, Active(3.0))
                     #=ShadowInit=#true
                 }(),
                 FA,
-                Duplicated{rt},
+                width == 1 ? Duplicated{rt} : BatchDuplicated{rt, width},
                 (tt′).parameters...
             )
             res = forward(f, args...)
@@ -477,10 +582,10 @@ Enzyme.autodiff(ReverseWithPrimal, x->x*x, Active(3.0))
             # then subtracting twice the imaginary component to get the correct result
 
             for (k, v) in seen
-                Compiler.recursive_accumulate(k, v, refn_seed)
+                Compiler.recursive_accumulate(k, v, Val(false), refn_seed)
             end
             for (k, v) in seen2
-                Compiler.recursive_accumulate(k, v, imfn_seed)
+                Compiler.recursive_accumulate(k, v, Val(false), imfn_seed)
             end
 
             fused = fuse_complex_results(results, args...)
@@ -512,7 +617,7 @@ Enzyme.autodiff(ReverseWithPrimal, x->x*x, Active(3.0))
     ) #=ShadowInit=#
 
     if A0 <: Active
-        args = (args..., Compiler.default_adjoint(rt))
+        args = (args..., Compiler.default_adjoint(rt, Val(width)))
     end
     thunk(f, args...)
 end
@@ -734,13 +839,15 @@ code, as well as high-order differentiation.
                     ErrIfFuncWritten,
                     #=ShadowInit=#true
                 }()
-            TapeType = tape_type(rs, FA, Duplicated{rt},
+            rt_annotation = width == 1 ? Duplicated{rt} : BatchDuplicated{rt, width}
+            TapeType = tape_type(
+                rs, FA, rt_annotation,
                 (tt′).parameters...)
             forward, adjoint = autodiff_deferred_thunk(
                 rs,
                 TapeType,
                 FA,
-                Duplicated{rt},
+                rt_annotation,
                 (tt′).parameters...
             )
             res = forward(f, args...)
@@ -793,7 +900,7 @@ code, as well as high-order differentiation.
     thunk =
         Compiler.CombinedAdjointThunk{Ptr{Cvoid},FA,A2,tt′,width,ReturnPrimal}(adjoint_ptr)
     if A <: Active
-        args = (args..., Compiler.default_adjoint(rt))
+        args = (args..., Compiler.default_adjoint(rt, Val(width)))
     elseif A <: Duplicated ||
            A <: DuplicatedNoNeed ||
            A <: BatchDuplicated ||
@@ -901,15 +1008,15 @@ end
     autodiff_thunk(::ReverseModeSplit, ftype, Activity, argtypes::Type{<:Annotation}...)
 
 Provide the split forward and reverse pass functions for annotated function type
-ftype when called with args of type `argtypes` when using reverse mode.
+`ftype` when called with args of type `argtypes` when using reverse mode.
 
 `Activity` is the Activity of the return value, it may be `Const`, `Active`,
 or `Duplicated` (or its variants `DuplicatedNoNeed`, `BatchDuplicated`, and
 `BatchDuplicatedNoNeed`).
 
-The forward function will return a tape, the primal (or nothing if not requested),
-and the shadow (or nothing if not a `Duplicated` variant), and tapes the corresponding
-type arguements provided.
+The forward function will return a tape, the primal (or `nothing` if not requested),
+and the shadow (or `nothing` if not a `Duplicated` variant), and tapes the corresponding
+type arguments provided.
 
 The reverse function will return the derivative of `Active` arguments, updating the `Duplicated`
 arguments in place. The same arguments to the forward pass should be provided, followed by
@@ -954,11 +1061,11 @@ result, ∂v, ∂A
         ShadowInit
     },
     ::Type{FA},
-    ::Type{A},
+    ::Type{A0},
     args::Vararg{Type{<:Annotation},Nargs},
 ) where {
     FA<:Annotation,
-    A<:Annotation,
+    A0<:Annotation,
     ReturnPrimal,
     ReturnShadow,
     Width,
@@ -981,12 +1088,19 @@ result, ∂v, ∂A
     end
 
     if ModifiedBetweenT === true
-        ModifiedBetween = Val(falses_from_args(Nargs + 1))
+        ModifiedBetween = Val(trues_from_args(Nargs + 1))
     else
         ModifiedBetween = Val(ModifiedBetweenT)
     end
 
     tt = Tuple{map(eltype, args)...}
+
+    A = if A0 isa UnionAll
+        rt0 = Compiler.primal_return_type(Reverse, eltype(FA), tt)
+        A0{rt0}
+    else
+        A0
+    end
 
     tt′ = Tuple{args...}
     opt_mi = if RABI <: NonGenABI
@@ -1015,6 +1129,8 @@ end
     autodiff(::Function, ::Mode, args...)
 
 Specialization of [`autodiff`](@ref) to handle do argument closures.
+ 
+Example:
 
 ```jldoctest
 
@@ -1046,12 +1162,12 @@ end
     autodiff_thunk(::ForwardMode, ftype, Activity, argtypes::Type{<:Annotation}...)
 
 Provide the thunk forward mode function for annotated function type
-ftype when called with args of type `argtypes`.
+`ftype` when called with args of type `argtypes`.
 
 `Activity` is the Activity of the return value, it may be `Const` or `Duplicated`
 (or its variants `DuplicatedNoNeed`, `BatchDuplicated`, and`BatchDuplicatedNoNeed`).
 
-The forward function will return the shadow (or nothing if not a `Duplicated` variant)
+The forward function will return the shadow (or `nothing` if not a `Duplicated` variant)
 and the primal (if requested).
 
 Example returning both the return derivative and original return:
@@ -1184,7 +1300,7 @@ end
     end
 
     if ModifiedBetweenT === true
-        ModifiedBetween = Val(falses_from_args(Nargs + 1))
+        ModifiedBetween = Val(trues_from_args(Nargs + 1))
     else
         ModifiedBetween = Val(ModifiedBetweenT)
     end
@@ -1266,7 +1382,7 @@ import .Compiler: remove_innerty, UnknownTapeType
     end
 
     if ModifiedBetweenT === true
-        ModifiedBetween = falses_from_args(Val(1), args...)
+        ModifiedBetween = trues_from_args(1+length(args))
     else
         ModifiedBetween = ModifiedBetweenT
     end
@@ -1301,7 +1417,12 @@ import .Compiler: remove_innerty, UnknownTapeType
         params = GPUCompiler.nest_params(params, parent_job.config.params)
     end
 
-    job = GPUCompiler.CompilerJob(mi, GPUCompiler.CompilerConfig(target, params; kernel = false))
+    # With a parent job, the tape belongs to a derivative that the parent compiles as a deferred job
+    # (`autodiff_deferred_thunk` in a kernel), i.e. not top-level: no target libraries are linked
+    # before differentiation (on CUDA, libdevice's `__nv_*` bodies), so the tape type must come from
+    # the same, non-top-level compilation.
+    config = GPUCompiler.CompilerConfig(target, params; kernel = false, toplevel = parent_job === nothing)
+    job = GPUCompiler.CompilerJob(mi, config)
 
 
     key = hash(parent_job, hash(job))
@@ -1338,15 +1459,15 @@ end
     autodiff_deferred_thunk(::ReverseModeSplit, TapeType::Type, ftype::Type{<:Annotation}, Activity::Type{<:Annotation}, argtypes::Type{<:Annotation}...)
 
 Provide the split forward and reverse pass functions for annotated function type
-ftype when called with args of type `argtypes` when using reverse mode.
+`ftype` when called with args of type `argtypes` when using reverse mode.
 
 `Activity` is the Activity of the return value, it may be `Const`, `Active`,
 or `Duplicated` (or its variants `DuplicatedNoNeed`, `BatchDuplicated`, and
 `BatchDuplicatedNoNeed`).
 
-The forward function will return a tape, the primal (or nothing if not requested),
-and the shadow (or nothing if not a `Duplicated` variant), and tapes the corresponding
-type arguements provided.
+The forward function will return a tape, the primal (or `nothing` if not requested),
+and the shadow (or `nothing` if not a `Duplicated` variant), and tapes the corresponding
+type arguments provided.
 
 The reverse function will return the derivative of `Active` arguments, updating the `Duplicated`
 arguments in place. The same arguments to the forward pass should be provided, followed by
@@ -1422,7 +1543,7 @@ result, ∂v, ∂A
     end
 
     if ModifiedBetweenT === true
-        ModifiedBetween = Val(falses_from_args(Nargs + 1))
+        ModifiedBetween = Val(trues_from_args(Nargs + 1))
     else
         ModifiedBetween = Val(ModifiedBetweenT)
     end
@@ -1510,6 +1631,8 @@ and may also be slower than not having a rule at all.
 
 Use with caution.
 
+Example:
+
 ```julia
 Enzyme.@import_frule(typeof(Base.sort), Any);
 
@@ -1538,9 +1661,9 @@ function _import_rrule end # defined in EnzymeChainRulesCoreExt extension
 """
     import_rrule(::fn, tys...)
 
-Automatically import a `ChainRules.rrule` as a custom reverse mode EnzymeRule. When called in batch mode, this
+Automatically import a `ChainRules.rrule` as a custom reverse mode `EnzymeRule`. When called in batch mode, this
 will end up calling the primal multiple times which results in slower code. This macro assumes that the underlying
-function to be imported is read-only, and returns a Duplicated or Const object. This macro also assumes that the
+function to be imported is read-only, and returns a `Duplicated` or `Const` object. This macro also assumes that the
 inputs permit a `.+=` operation and that the output has a valid `Enzyme.make_zero` function defined. It also assumes
 that `overwritten(x)` accurately describes if there is any non-preserved data from forward to reverse, not just
 the outermost data structure being overwritten as provided by the specification.
@@ -1561,6 +1684,7 @@ macro import_rrule(args...)
     return _import_rrule(args...)
 end
 
+include("late_generated.jl")
 include("precompile.jl")
 
 end # module

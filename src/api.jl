@@ -408,6 +408,7 @@ function EnzymeCreateAugmentedPrimal(
     shadowReturnUsed,
     typeInfo,
     uncacheable_args,
+    nowrite_shadows,
     forceAnonymousTape,
     runtimeActivity,
     strongZero,
@@ -433,6 +434,8 @@ function EnzymeCreateAugmentedPrimal(
             UInt8,
             Ptr{UInt8},
             Csize_t,
+            Ptr{UInt8},
+            Csize_t,
             UInt8,
             UInt8,
             UInt8,
@@ -453,6 +456,8 @@ function EnzymeCreateAugmentedPrimal(
         subsequent_calls_may_write,
         uncacheable_args,
         length(uncacheable_args),
+        nowrite_shadows,
+        length(nowrite_shadows),
         forceAnonymousTape,
         runtimeActivity,
         strongZero,
@@ -594,6 +599,14 @@ EnzymeGradientUtilsErase(gutils, a) = ccall(
     gutils,
     a,
 )
+EnzymeReplaceOriginalToNew(gutils, orig, rep) = ccall(
+    (:EnzymeReplaceOriginalToNew, libEnzyme),
+    Cvoid,
+    (EnzymeGradientUtilsRef, LLVMValueRef, LLVMValueRef),
+    gutils,
+    orig,
+    rep
+)
 EnzymeGradientUtilsEraseWithPlaceholder(gutils, a, orig, erase) = ccall(
     (:EnzymeGradientUtilsEraseWithPlaceholder, libEnzyme),
     Cvoid,
@@ -615,6 +628,12 @@ EnzymeGradientUtilsGetWidth(gutils) = ccall(
     (EnzymeGradientUtilsRef,),
     gutils,
 )
+EnzymeGradientUtilsGetLogic(gutils) = ccall(
+    (:EnzymeGradientUtilsGetLogic, libEnzyme),
+    EnzymeLogicRef,
+    (EnzymeGradientUtilsRef,),
+    gutils,
+)
 EnzymeGradientUtilsGetRuntimeActivity(gutils) =
     ccall(
         (:EnzymeGradientUtilsGetRuntimeActivity, libEnzyme),
@@ -625,6 +644,13 @@ EnzymeGradientUtilsGetRuntimeActivity(gutils) =
 EnzymeGradientUtilsGetStrongZero(gutils) =
     ccall(
         (:EnzymeGradientUtilsGetStrongZero, libEnzyme),
+        UInt8,
+        (EnzymeGradientUtilsRef,),
+        gutils,
+    ) != 0
+EnzymeGradientUtilsGetAtomicAdd(gutils) =
+    ccall(
+        (:EnzymeGradientUtilsGetAtomicAdd, libEnzyme),
         UInt8,
         (EnzymeGradientUtilsRef,),
         gutils,
@@ -800,6 +826,15 @@ EnzymeGradientUtilsGetReturnDiffeType(gutils, orig, needsPrimalP, needsShadowP, 
         mode,
     )
 
+EnzymeGradientUtilsGetAugmentedPrimalReturnUsed(gutils, orig) =
+    ccall(
+    (:EnzymeGradientUtilsGetAugmentedPrimalReturnUsed, libEnzyme),
+    UInt8,
+    (EnzymeGradientUtilsRef, LLVMValueRef),
+    gutils,
+    orig,
+)
+
 EnzymeGradientUtilsSubTransferHelper(
     gutils,
     mode,
@@ -809,8 +844,10 @@ EnzymeGradientUtilsSubTransferHelper(
     srcAlign,
     offset,
     dstConstant,
+    shadowdst,
     origdst,
     srcConstant,
+    shadowsrc,
     origsrc,
     length,
     isVolatile,
@@ -830,7 +867,9 @@ EnzymeGradientUtilsSubTransferHelper(
         UInt64,
         UInt8,
         LLVMValueRef,
+        LLVMValueRef,
         UInt8,
+        LLVMValueRef,
         LLVMValueRef,
         LLVMValueRef,
         LLVMValueRef,
@@ -846,8 +885,10 @@ EnzymeGradientUtilsSubTransferHelper(
     srcAlign,
     offset,
     dstConstant,
+    shadowdst,
     origdst,
     srcConstant,
+    shadowsrc,
     origsrc,
     length,
     isVolatile,
@@ -884,7 +925,7 @@ EnzymeGradientUtilsSetReverseBlock(
     block,
 ) = ccall(
     (:EnzymeGradientUtilsSetReverseBlock, libEnzyme),
-    LLVM.API.LLVMBasicBlockRef,
+    Cvoid,
     (
         EnzymeGradientUtilsRef,
         LLVM.API.LLVMBasicBlockRef,
@@ -940,8 +981,10 @@ function sub_transfer(
     srcAlign,
     offset,
     dstConstant,
+    shadowdst,
     origdst,
     srcConstant,
+    shadowsrc,
     origsrc,
     length,
     isVolatile,
@@ -949,11 +992,17 @@ function sub_transfer(
     allowForward,
     shadowsLookedUp,
 )
-    GC.@preserve secretty begin
+    GC.@preserve secretty origdst begin
         if secretty === nothing
             secretty = Base.unsafe_convert(LLVMTypeRef, C_NULL)
         else
             secretty = Base.unsafe_convert(LLVMTypeRef, secretty)
+        end
+
+        if origdst === nothing
+            origdst = Base.unsafe_convert(LLVMValueRef, C_NULL)
+        else
+            origdst = Base.unsafe_convert(LLVMValueRef, origdst)
         end
 
         EnzymeGradientUtilsSubTransferHelper(
@@ -965,8 +1014,10 @@ function sub_transfer(
             srcAlign,
             offset,
             dstConstant,
+            shadowdst,
             origdst,
             srcConstant,
+            shadowsrc,
             origsrc,
             length,
             isVolatile,
@@ -1058,7 +1109,7 @@ end
     printperf!(val::Bool)
 
 An debugging option for developers of Enzyme. If one sets this flag prior
-to the first differentiation of a function, Enzyme will print (to stderr)
+to the first differentiation of a function, Enzyme will print (to `stderr`)
 performance information about generated derivative programs. It will provide
 debug information that warns why particular values are cached for the
 reverse pass, and thus require additional computation/storage. This is particularly
@@ -1074,9 +1125,9 @@ end
     printdiffuse!(val::Bool)
 
 An debugging option for developers of Enzyme. If one sets this flag prior
-to the first differentiation of a function, Enzyme will print (to stderr)
+to the first differentiation of a function, Enzyme will print (to `stderr`)
 information about each LLVM value -- specifically whether it and its shadow
-is required for computing the derivative. In contrast to [`printunnecessary!`](@ref),
+are required for computing the derivative. In contrast to [`printunnecessary!`](@ref),
 this flag prints debug log for the analysis which determines for each value
 and shadow value, whether it can find a user which would require it to be kept
 around (rather than being deleted). This is prior to any cache optimizations
@@ -1093,7 +1144,7 @@ end
     printtype!(val::Bool)
 
 An debugging option for developers of Enzyme. If one sets this flag prior
-to the first differentiation of a function, Enzyme will print (to stderr)
+to the first differentiation of a function, Enzyme will print (to `stderr`)
 a log of all decisions made during Type Analysis (the analysis which
 Enzyme determines the type of all values in the program). This may be useful
 for debugging correctness errors, illegal type analysis errors, insufficient
@@ -1109,7 +1160,7 @@ end
     printactivity!(val::Bool)
 
 An debugging option for developers of Enzyme. If one sets this flag prior
-to the first differentiation of a function, Enzyme will print (to stderr)
+to the first differentiation of a function, Enzyme will print (to `stderr`)
 a log of all decisions made during Activity Analysis (the analysis which
 determines what values/instructions are differentiated). This may be useful
 for debugging MixedActivity errors, correctness, and performance errors.
@@ -1124,7 +1175,7 @@ end
     printall!(val::Bool)
 
 An debugging option for developers of Enzyme. If one sets this flag prior
-to the first differentiation of a function, Enzyme will print (to stderr)
+to the first differentiation of a function, Enzyme will print (to `stderr`)
 the LLVM function being differentiated, as well as all generated derivatives
 immediately after running Enzyme (but prior to any other optimizations).
 Off by default
@@ -1138,7 +1189,7 @@ end
     printunnecessary!(val::Bool)
 
 An debugging option for developers of Enzyme. If one sets this flag prior
-to the first differentiation of a function, Enzyme will print (to stderr)
+to the first differentiation of a function, Enzyme will print (to `stderr`)
 information about each LLVM value -- specifically whether it and its shadow
 is required for computing the derivative. In contrast to [`printdiffuse!`](@ref),
 this flag prints the final results after running cache optimizations such
@@ -1254,7 +1305,7 @@ end
 """
     typeWarning!(val::Bool)
 
-Whether to print a warning when Type Analysis learns informatoin about a value's type
+Whether to print a warning when Type Analysis learns information about a value's type
 which cannot be represented in the current size of the lattice. See [`maxtypeoffset!`](@ref) for
 more information.
 Off by default.
@@ -1279,7 +1330,7 @@ end
 """
     memmove_warning!(val::Bool)
 
-Whether to issue a warning when differentiating memmove.
+Whether to issue a warning when differentiating `memmove`.
 Off by default.
 """
 function memmove_warning!(val)
@@ -1316,7 +1367,12 @@ end
     ET_TypeDepthExceeded = 6,
     ET_MixedActivityError = 7,
     ET_IllegalReplaceFicticiousPHIs = 8,
-    ET_GetIndexError = 9
+    ET_GetIndexError = 9,
+    ET_NoTruncate = 10,
+    ET_GCRewrite = 11,
+    ET_NaNError = 12,
+    ET_ShowInternalError = 12,
+    ET_NoAccumulate = 13,
 )
 
 function EnzymeTypeAnalyzerToString(typeanalyzer)
@@ -1439,6 +1495,26 @@ function EnzymeCopyMetadata(i1, i2)
     )
 end
 
+function EnzymeCopyAlignment(i1::LLVM.AllocaInst, i2::LLVM.AllocaInst)
+    ccall(
+        (:EnzymeCopyAlignment, libEnzyme),
+        Cvoid,
+        (LLVM.API.LLVMValueRef, LLVM.API.LLVMValueRef),
+        i1,
+        i2,
+    )
+end
+
+function EnzymeTakeName(i1, i2)
+    ccall(
+        (:EnzymeTakeName, libEnzyme),
+        Cvoid,
+        (LLVM.API.LLVMValueRef, LLVM.API.LLVMValueRef),
+        i1,
+        i2,
+    )
+end
+
 function SetMustCache!(i1)
     ccall((:EnzymeSetMustCache, libEnzyme), Cvoid, (LLVM.API.LLVMValueRef,), i1)
 end
@@ -1483,6 +1559,14 @@ function EnzymeDumpModuleRef(mod)
     ccall((:EnzymeDumpModuleRef, libEnzyme), Cvoid, (LLVM.API.LLVMModuleRef,), mod)
 end
 
+function EnzymeDumpValueRef(mod)
+    ccall((:EnzymeDumpValueRef, libEnzyme), Cvoid, (LLVM.API.LLVMValueRef,), mod)
+end
+
+function EnzymeDumpTypeRef(mod)
+    ccall((:EnzymeDumpTypeRef, libEnzyme), Cvoid, (LLVM.API.LLVMValueRef,), mod)
+end
+
 EnzymeComputeByteOffsetOfGEP(B, V, T) = LLVM.Value(
     ccall(
         (:EnzymeComputeByteOffsetOfGEP, libEnzyme),
@@ -1524,18 +1608,7 @@ EnzymeAnonymousAliasScope(dom::LLVM.Metadata, str) = LLVM.Metadata(
         str,
     ),
 )
-EnzymeFixupJuliaCallingConvention(f) = ccall(
-    (:EnzymeFixupJuliaCallingConvention, libEnzyme),
-    Cvoid,
-    (LLVM.API.LLVMValueRef,),
-    f,
-)
-EnzymeFixupBatchedJuliaCallingConvention(f) = ccall(
-    (:EnzymeFixupBatchedJuliaCallingConvention, libEnzyme),
-    Cvoid,
-    (LLVM.API.LLVMValueRef,),
-    f,
-)
+
 
 e_extract_value!(builder, AggVal, Index, Name::String = "") = GC.@preserve Index begin
     LLVM.Value(

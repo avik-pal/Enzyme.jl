@@ -1,5 +1,5 @@
 function return_type(interp::Core.Compiler.AbstractInterpreter, mi::Core.MethodInstance)::Type
-    @static if VERSION < v"1.11.0"
+    return @static if VERSION < v"1.11.0"
         code = Core.Compiler.get(Core.Compiler.code_cache(interp), mi, nothing)
         if code isa Core.Compiler.CodeInstance
             return code.rettype
@@ -14,17 +14,14 @@ function return_type(interp::Core.Compiler.AbstractInterpreter, mi::Core.MethodI
 end
 
 function primal_interp_world(
-    @nospecialize(::ReverseMode),
-    world::UInt
-)
+        @nospecialize(::ReverseMode),
+        world::UInt
+    )
     mode = Enzyme.API.DEM_ReverseModeCombined
 
     CT = @static if VERSION >= v"1.11.0-DEV.1552"
         EnzymeCacheToken(
-            typeof(DefaultCompilerTarget()),
-            false,
-            GPUCompiler.GLOBAL_METHOD_TABLE, #=job.config.always_inline=#
-            EnzymeCompilerParams,
+            (GPUCompiler.GLOBAL_METHOD_TABLE,),
             world,
             false,
             true,
@@ -34,21 +31,18 @@ function primal_interp_world(
         Enzyme.Compiler.GLOBAL_REV_CACHE
     end
 
-    Enzyme.Compiler.Interpreter.EnzymeInterpreter(CT, nothing, world, mode, true)
+    return Enzyme.Compiler.Interpreter.EnzymeInterpreter(CT, nothing, world, mode, true)
 end
 
 function primal_interp_world(
-    @nospecialize(::ForwardMode),
-    world::UInt
-)
+        @nospecialize(::ForwardMode),
+        world::UInt
+    )
     mode = Enzyme.API.DEM_ForwardMode
 
     CT = @static if VERSION >= v"1.11.0-DEV.1552"
         EnzymeCacheToken(
-            typeof(DefaultCompilerTarget()),
-            false,
-            GPUCompiler.GLOBAL_METHOD_TABLE, #=job.config.always_inline=#
-            EnzymeCompilerParams,
+            (GPUCompiler.GLOBAL_METHOD_TABLE,),
             world,
             true,
             false,
@@ -58,28 +52,29 @@ function primal_interp_world(
         Enzyme.Compiler.GLOBAL_FWD_CACHE
     end
 
-    Enzyme.Compiler.Interpreter.EnzymeInterpreter(CT, nothing, world, mode, true)
+    return Enzyme.Compiler.Interpreter.EnzymeInterpreter(CT, nothing, world, mode, true)
 end
 
 @inline primal_interp_world(
     @nospecialize(::ReverseModeSplit),
-    world::UInt) = primal_interp_world(Reverse, world)
+    world::UInt
+) = primal_interp_world(Reverse, world)
 
 function primal_return_type_world(
-    @nospecialize(mode::Mode),
-    world::UInt,
-    @nospecialize(TT::Type),
-)
-    Core.Compiler._return_type(primal_interp_world(mode, world), TT)
+        @nospecialize(mode::Mode),
+        world::UInt,
+        @nospecialize(TT::Type),
+    )
+    return Core.Compiler._return_type(primal_interp_world(mode, world), TT)
 end
 
 function primal_return_type_world(
-    @nospecialize(mode::Mode),
-    world::UInt,
-    mi::Core.MethodInstance,
-)
+        @nospecialize(mode::Mode),
+        world::UInt,
+        mi::Core.MethodInstance,
+    )
     interp = primal_interp_world(mode, world)
-    return_type(interp, mi)
+    return return_type(interp, mi)
 end
 
 primal_return_type_world(
@@ -87,7 +82,9 @@ primal_return_type_world(
     world::UInt,
     @nospecialize(FT::Type),
     @nospecialize(TT::Type),
-   ) = primal_return_type_world(mode, world, Tuple{FT, TT.parameters...})
+) = primal_return_type_world(mode, world, Tuple{FT, TT.parameters...})
+
+function primal_return_type end
 
 function primal_return_type_generator(world::UInt, source, self, @nospecialize(mode::Type), @nospecialize(ft::Type), @nospecialize(tt::Type))
     @nospecialize
@@ -102,70 +99,33 @@ function primal_return_type_generator(world::UInt, source, self, @nospecialize(m
         error("$(GPUCompiler.unsafe_function_from_type(ft)) is not a generic function")
 
     # look up the method
-    method_error = :(throw(MethodError(ft, tt, $world)))
-    
     min_world = Ref{UInt}(typemin(UInt))
     max_world = Ref{UInt}(typemax(UInt))
-   
+
     mi = my_methodinstance(mode, ft, tt, world, min_world, max_world)
 
+    slotnames = Core.svec(Symbol("#self#"), :mode, :ft, :tt)
     stub = Core.GeneratedFunctionStub(
         identity,
-        Core.svec(:methodinstance, :mode, :ft, :tt),
+        slotnames,
         Core.svec(),
     )
-    mi === nothing && return stub(world, source, method_error)
+    mi === nothing && return stub(world, source, :(throw(MethodError(ft, tt, $world))))
 
-    min_world2 = Ref{UInt}(typemin(UInt))
-    max_world2 = Ref{UInt}(typemax(UInt))
-   
-    mi2 = my_methodinstance(mode, typeof(Base.identity), Tuple{Nothing}, world, min_world2, max_world2)
+    result = primal_return_type_world(mode, world, mi)
+    code = Any[Core.Compiler.ReturnNode(result)]
+    # create an empty CodeInfo to return the result
+    ci = create_fresh_codeinfo(primal_return_type, source, world, slotnames, code)
+    ci.max_world = max_world[]
 
-    ci = Core.Compiler.retrieve_code_info(mi2, world)::Core.Compiler.CodeInfo
-
-    # prepare a new code info
-    new_ci = copy(ci)
-    empty!(new_ci.code)
-    @static if isdefined(Core, :DebugInfo)
-      new_ci.debuginfo = Core.DebugInfo(:none)
-    else
-      empty!(new_ci.codelocs)
-      resize!(new_ci.linetable, 1)                # see note below
-    end
-    empty!(new_ci.ssaflags)
-    new_ci.ssavaluetypes = 0
-    new_ci.min_world = min_world[]
-    new_ci.max_world = max_world[]
-    new_ci.edges = Core.MethodInstance[mi]
+    ci.edges = Any[]
     # XXX: setting this edge does not give us proper method invalidation, see
     #      JuliaLang/julia#34962 which demonstrates we also need to "call" the kernel.
     #      invoking `code_llvm` also does the necessary codegen, as does calling the
     #      underlying C methods -- which GPUCompiler does, so everything Just Works.
+    add_edge!(ci.edges, mi)
 
-    # prepare the slots
-    new_ci.slotnames = Symbol[Symbol("#self#"), :mode, :ft, :tt]
-    new_ci.slotflags = UInt8[0x00 for i = 1:4]
-
-    # return the codegen world age
-    res = primal_return_type_world(mode, world, mi)
-    push!(new_ci.code, Core.Compiler.ReturnNode(res))
-    push!(new_ci.ssaflags, 0x00)   # Julia's native compilation pipeline (and its verifier) expects `ssaflags` to be the same length as `code`
-    @static if isdefined(Core, :DebugInfo)
-    else
-      push!(new_ci.codelocs, 1)   # see note below
-    end
-    new_ci.ssavaluetypes += 1
-
-    # NOTE: we keep the first entry of the original linetable, and use it for location info
-    #       on the call to check_cache. we can't not have a codeloc (using 0 causes
-    #       corruption of the back trace), and reusing the target function's info
-    #       has as advantage that we see the name of the kernel in the backtraces.
-
-    return new_ci
+    return ci
 end
 
-@eval Base.@assume_effects :removable :foldable :nothrow @inline function primal_return_type(mode::Mode, ft::Type, tt::Type)
-    $(Expr(:meta, :generated_only))
-    $(Expr(:meta, :generated, primal_return_type_generator))
-end
-
+# The generated wrapper `primal_return_type` is defined in src/late_generated.jl; see the note there.

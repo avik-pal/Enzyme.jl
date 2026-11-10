@@ -535,6 +535,22 @@ function test_make_zero()
         @test df.v == [0.0, 0.0]
         @test df.callback === f.callback
     end
+    @testset "Dict and inactive mutable aliasing" begin
+        d = Dict{Any, Any}()
+        sizehint!(d, 16)
+        d_makez = make_zero(d)
+        @test d.slots !== d_makez.slots
+        d[1] = 2.0
+        @test isempty(d_makez)
+
+        k = [1.0] # mutable key to verify original key is preserved
+        d2 = Dict{Any, Any}(k => [3.0, 4.0])
+        d2_makez = make_zero(d2)
+        @test d2.slots !== d2_makez.slots
+        @test d2_makez[k] == [0.0, 0.0]
+        @test d2_makez[k] !== d2[k]
+        @test first(keys(d2_makez)) === k
+    end
     return nothing
 end
 
@@ -755,5 +771,70 @@ end
 @testset "make_zero" test_make_zero()
 @testset "make_zero!" test_make_zero!()
 @testset "remake_zero!" test_remake_zero!()
+
+# Forward-mode differentiability of `jl_field_isdefined_checked`, the bookkeeping
+# builtin make_zero emits for the `isdefined(prev, i)` field walk when recursing
+# through undef-able / abstract fields. It showed up as `EnzymeNoDerivativeError`
+# when nesting forward-over-reverse — see EnzymeAD/Enzyme.jl#3135.
+mutable struct MaybeUndefField
+    a::Float64
+    b::Any
+end
+function isdefined_field_walk(x)
+    m = MaybeUndefField(x, x)
+    s = 0.0
+    for i in 1:nfields(m)
+        if isdefined(m, i)  # runtime index -> jl_field_isdefined_checked
+            s += x
+        end
+    end
+    return s
+end
+
+@static if VERSION >= v"1.11-"
+    struct MemoryRefWrapper{T}
+        ref::MemoryRef{T}
+        len::Int
+    end
+
+    @testset "make_zero of MemoryRef" begin
+        v = [1.0, 2.0, 3.0, 4.0]
+        for ref in (v.ref, Base.memoryref(v.ref.mem, 3))
+            z = make_zero(ref)
+            @test z.mem !== ref.mem
+            @test all(iszero, z.mem)
+            @test Base.memoryrefoffset(z) == Base.memoryrefoffset(ref)
+            # the shadow points into the shadow memory, not into the primal data
+            @test pointer(z) == pointer(z.mem, Base.memoryrefoffset(ref))
+            @test pointer(z) != pointer(ref)
+            z[] = 5.0
+            @test v == [1.0, 2.0, 3.0, 4.0]
+        end
+
+        # inside a struct, with the Memory shared with another field
+        w = (MemoryRefWrapper(v.ref, 4), v.ref.mem)
+        z = make_zero(w)
+        @test z[1].ref.mem === z[2]
+        @test pointer(z[1].ref) == pointer(z[2])
+
+        # empty memory (empty `Memory` instances are shared singletons)
+        e = Float64[]
+        z = make_zero(e.ref)
+        @test length(z.mem) == 0
+        @test pointer(z) == pointer(z.mem)
+
+        # MemoryRef of a non-isbits element type stores an offset, not a pointer
+        a = Any[1.0, [2.0]]
+        za = make_zero(Base.memoryref(a.ref.mem, 2))
+        @test za.mem !== a.ref.mem
+        @test za[] == [0.0]
+        @test a[2] == [2.0]
+    end
+end
+
+@testset "forward inactivity of make_zero shadow-init builtins" begin
+    # both fields defined -> s = 2x, derivative 2
+    @test Enzyme.autodiff(Forward, isdefined_field_walk, Duplicated(2.0, 1.0)) == (2.0,)
+end
 
 end  # module MakeZeroTests

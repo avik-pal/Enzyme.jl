@@ -1,3 +1,18 @@
+struct BuiltinWrapper{F}
+    f::F
+end
+
+@generated function (w::BuiltinWrapper{F})(args::Vararg{Any,N}) where {F, N}
+   cargs = Expr[]
+   for i in 1:N
+      push!(cargs, :(args[$i]))
+   end
+   cexp = Expr(:call, F.instance, cargs...)
+   return quote
+	Base.@_inline_meta
+	$cexp
+   end
+end
 
 @generated function create_activity_wrapper(::Val{Width}, ::Val{atup}, ::Val{aref}, primarg::PT, shadowarg) where {Width, atup, aref, PT}
     if atup && aref != AnyState
@@ -118,7 +133,7 @@ function setup_macro_wraps(
             push!(modbetween, :(ntuple(Returns(MB[$i]), Val(length($(primargs[i]))))))
         end
         aref = Symbol("active_ref_$i")
-        push!(active_refs, Expr(:(=), aref, Expr(:call, active_reg_nothrow, primtypes[i], Val(nothing))))
+        push!(active_refs, Expr(:(=), aref, Expr(:call, active_reg_nothrow, primtypes[i])))
         expr = if iterate
             if forwardMode
                 dupexpr = if Width == 1
@@ -281,6 +296,11 @@ function body_runtime_generic_fwd(N, Width, wrapped, primtypes, dfns)
     end
 
     return quote
+        f = if f isa Core.Builtin
+            BuiltinWrapper(f)
+        else
+            f
+        end
         args = ($(wrapped...),)
 
         # TODO: Annotation of return value
@@ -475,6 +495,12 @@ function body_runtime_generic_augfwd(N, Width, wrapped, primttypes, active_refs,
     end
 
     return quote
+        f_unwrapped = f
+        f = if f isa Core.Builtin
+            BuiltinWrapper(f)
+        else
+            f
+        end
         $(active_refs...)
         args = ($(wrapped...),)
         $(MakeTypes...)
@@ -487,7 +513,7 @@ function body_runtime_generic_augfwd(N, Width, wrapped, primttypes, active_refs,
         end
 
 
-        internal_tape, origRet, initShadow, annotation = if f isa typeof(Core.getglobal)
+        internal_tape, origRet, initShadow, annotation = if f_unwrapped isa typeof(Core.getglobal)
             gv = Core.getglobal(args[1].val, args[2].val)
             @assert sizeof(gv) == 0
             (nothing, gv, nothing, Const)
@@ -613,7 +639,16 @@ function nonzero_active_data(x::T) where {T}
     return false
 end
 
-function body_runtime_generic_rev(N, Width, wrapped, primttypes, shadowargs, active_refs)
+function body_runtime_generic_rev(
+    N,
+    Width,
+    Atomic,
+    wrapped,
+    primttypes,
+    shadowargs,
+    active_refs,
+    dfns,
+)
     outs = Vector{Expr}(undef, N*Width)
     for i = 1:N
         for w = 1:Width
@@ -626,7 +661,11 @@ function body_runtime_generic_rev(N, Width, wrapped, primttypes, shadowargs, act
             out = quote
                 if tup[$i] === nothing
                 elseif $shad isa Base.RefValue
-                    $shad[] = recursive_add($shad[], $expr)
+                    if $Atomic
+                        Compiler.recursive_accumulate($shad, Base.RefValue($expr), Val(true))
+                    else
+                        $shad[] = recursive_add($shad[], $expr)
+                    end
                 else
                     throw(EnzymeNonScalarReturnException($shad, " tup[i]=" *
                         string(tup[$i]) *
@@ -663,22 +702,48 @@ function body_runtime_generic_rev(N, Width, wrapped, primttypes, shadowargs, act
     end
 
     dup = if Width == 1
-        :(Duplicated(f, df))
-    else
-        fargs = [:df]
-        for i = 2:Width
-            push!(fargs, Symbol("df_$i"))
+        quote
+            if df isa Base.RefValue && !(f isa Base.RefValue)
+                MixedDuplicated(f, df)
+            else
+                Duplicated(f, df)
+            end
         end
-        :(BatchDuplicated(f, ($(fargs...),)))
+    else
+        quote
+            if df isa Base.RefValue && !(f isa Base.RefValue)
+                BatchMixedDuplicated(f, ($(dfns...),))
+            else
+                BatchDuplicated(f, ($(dfns...),))
+            end
+        end
     end
     dupty = if Width == 1
-        :(Duplicated{FT})
+        quote
+            if df isa Base.RefValue && !(f isa Base.RefValue)
+                MixedDuplicated{FT}
+            else
+                Duplicated{FT}
+            end
+        end
     else
-        :(BatchDuplicated{FT,$Width})
+        quote
+            if df isa Base.RefValue && !(f isa Base.RefValue)
+                BatchMixedDuplicated{FT,$Width}
+            else
+                BatchDuplicated{FT,$Width}
+            end
+        end
     end
 
     quote
-        if f isa typeof(Core.getglobal)
+        f_unwrapped = f
+        f = if f isa Core.Builtin
+            BuiltinWrapper(f)
+        else
+            f
+        end
+        if f_unwrapped isa typeof(Core.getglobal)
         else
             $(active_refs...)
             args = ($(wrapped...),)
@@ -696,6 +761,8 @@ function body_runtime_generic_rev(N, Width, wrapped, primttypes, shadowargs, act
 
             annotation = if $Width != 1 && annotation0 <: Duplicated
                 BatchDuplicated{rt,$Width}
+            elseif $Width != 1 && annotation0 <: MixedDuplicated
+                BatchMixedDuplicated{rt, $Width}
             else
                 annotation0
             end
@@ -737,11 +804,20 @@ function body_runtime_generic_rev(N, Width, wrapped, primttypes, shadowargs, act
     end
 end
 
-function func_runtime_generic_rev(N, Width)
+function func_runtime_generic_rev(N, Width, Atomic)
     _, _, primtypes, allargs, typeargs, wrapped, batchshadowargs, _, active_refs, dfns =
         setup_macro_wraps(false, N, Width)
     body =
-        body_runtime_generic_rev(N, Width, wrapped, primtypes, batchshadowargs, active_refs)
+        body_runtime_generic_rev(
+            N,
+            Width,
+            Atomic,
+            wrapped,
+            primtypes,
+            batchshadowargs,
+            active_refs,
+            dfns,
+        )
 
     quote
         function runtime_generic_rev(
@@ -750,6 +826,7 @@ function func_runtime_generic_rev(N, Width)
             strongZero::Val{StrongZero},
             width::Val{$Width},
             ModifiedBetween::Val{MB},
+            atomic::Val{$Atomic},
             tape::TapeType,
             f::F,
             df::DF,
@@ -766,21 +843,24 @@ end
     strongZero::Val{StrongZero},
     width::Val{Width},
     ModifiedBetween::Val{MB},
+    atomic::Val{Atomic},
     tape::TapeType,
     f::F,
     df::DF,
     allargs...,
-) where {ActivityTup,MB,RuntimeActivity,StrongZero,Width,TapeType,F,DF}
+) where {ActivityTup,MB,RuntimeActivity,StrongZero,Width,Atomic,TapeType,F,DF}
     N = div(length(allargs) + 2, Width + 1) - 1
     _, _, primtypes, _, _, wrapped, batchshadowargs, _, active_refs, dfns =
         setup_macro_wraps(false, N, Width, :allargs)
     return body_runtime_generic_rev(
         N,
         Width,
+        Atomic,
         wrapped,
         primtypes,
         batchshadowargs,
         active_refs,
+        dfns,
     )
 end
 
@@ -869,7 +949,7 @@ end
 
 @inline function (v::PushInnerStruct{reverse})(@nospecialize(arg), @nospecialize(darg)) where reverse
     ty = Core.Typeof(arg)
-    actreg = active_reg_nothrow(ty, Val(nothing))
+    actreg = active_reg_nothrow(ty)
     if actreg == AnyState
         Const(arg)
     elseif actreg == ActiveState
@@ -905,7 +985,7 @@ end
         Base.@_inline_meta
         arg = args[i]
         ty = Core.Typeof(arg)
-        actreg = active_reg_nothrow(ty, Val(nothing))
+        actreg = active_reg_nothrow(ty)
         if actreg == AnyState
             Const(arg)
         elseif actreg == ActiveState
@@ -939,7 +1019,7 @@ end
         Base.@_inline_meta
         arg = args[i]
         ty = Core.Typeof(arg)
-        actreg = active_reg_nothrow(ty, Val(nothing))
+        actreg = active_reg_nothrow(ty)
         if actreg == AnyState
             Const(arg)
         elseif actreg == ActiveState
@@ -967,7 +1047,7 @@ end
         Base.@_inline_meta
         arg = args[i]
         ty = Core.Typeof(arg)
-        actreg = active_reg_nothrow(ty, Val(nothing))
+        actreg = active_reg_nothrow(ty)
         if actreg == AnyState
             Const(arg)
         elseif actreg == ActiveState
@@ -1087,6 +1167,11 @@ function body_runtime_iterate_fwd(N, Width, wrapped, primtypes, active_refs)
         @inbounds wrappedexexpand[i] = :($(wrapped[i])...)
     end
     return quote
+        f = if f isa Core.Builtin
+            BuiltinWrapper(f)
+        else
+            f
+        end
         $(active_refs...)
         args = ($(wrappedexexpand...),)
         tt′ = Enzyme.vaTypeof(args...)
@@ -1375,6 +1460,11 @@ function body_runtime_iterate_augfwd(N, Width, modbetween, wrapped, primtypes, a
         results[i] = :(tmpvals[$i])
     end
     return quote
+        f = if f isa Core.Builtin
+            BuiltinWrapper(f)
+        else
+            f
+        end
         refs = Base.RefValue[]
         $(active_refs...)
         args = ($(wrappedexexpand...),)
@@ -1684,6 +1774,11 @@ function body_runtime_iterate_rev(
         push!(shadowsplat, :(($(s...),)))
     end
     quote
+        f = if f isa Core.Builtin
+            BuiltinWrapper(f)
+        else
+            f
+        end
         (tape0, refs) = tape
         $(active_refs...)
         args = ($(wrappedexexpand...),)
@@ -1797,7 +1892,8 @@ function generic_setup(
     gutils,
     start,
     B::LLVM.IRBuilder,
-    lookup;
+        lookup,
+        enzyme_ctx::EnzymeContext;
     sret = nothing,
     tape = nothing,
     firstconst = false,
@@ -1808,9 +1904,8 @@ function generic_setup(
 )
     width = get_width(gutils)
     mode = get_mode(gutils)
-    mod = LLVM.parent(LLVM.parent(LLVM.parent(orig)))
-
-    ops = collect(operands(orig))[start+firstconst:end-1]
+    ops = @view arg_operands_view(orig)[start+firstconst:end]
+    ops_count = length(ops)
 
     T_int8 = LLVM.Int8Type()
     T_jlvalue = LLVM.StructType(LLVMType[])
@@ -1818,7 +1913,7 @@ function generic_setup(
 
     ActivityList = LLVM.Value[]
 
-    @assert length(ops) != 0
+    @assert ops_count != 0
     fill_val = unsafe_to_llvm(B, nothing)
 
     vals = LLVM.Value[]
@@ -1885,7 +1980,7 @@ function generic_setup(
             push!(vals, ev)
         end
     end
-    @assert length(ActivityList) == length(ops)
+    @assert length(ActivityList) == ops_count
 
     if tape !== nothing
         if tape isa Vector
@@ -1914,8 +2009,11 @@ function generic_setup(
 
         ModifiedBetween = Bool[]
 
-        for idx = 1:(length(ops)+firstconst)
+        for idx = 1:(ops_count+firstconst)
             push!(ModifiedBetween, uncacheable[(start-1)+idx] != 0)
+        end
+        if func == runtime_generic_rev
+            pushfirst!(vals, unsafe_to_llvm(B, Val(get_atomic_add(gutils))))
         end
         pushfirst!(vals, unsafe_to_llvm(B, Val((ModifiedBetween...,))))
     end
@@ -1927,8 +2025,8 @@ function generic_setup(
     if runtime_activity
         pushfirst!(vals, unsafe_to_llvm(B, Val(get_runtime_activity(gutils))))
     end
-    etup0 = emit_tuple!(B, ActivityList)
-    etup = emit_apply_type!(B, Base.Val, LLVM.Value[etup0])
+    etup0 = emit_tuple!(B, ActivityList, enzyme_ctx)
+    etup = emit_apply_type!(B, Base.Val, LLVM.Value[etup0], enzyme_ctx)
     if isa(etup, LLVM.Instruction)
         @assert length(collect(LLVM.uses(etup0))) == 1
     end
@@ -1936,6 +2034,18 @@ function generic_setup(
 
     pushfirst!(vals, unsafe_to_llvm(B, func))
 
+    T_jlvalue = LLVM.StructType(LLVMType[])
+    T_prjlvalue = LLVM.PointerType(T_jlvalue, Tracked)
+
+    for v in vals
+       if value_type(v) != T_prjlvalue
+          if value_type(v) isa LLVM.PointerType && LLVM.addrspace(value_type(v)) == Tracked
+             continue
+          end
+          throw(AssertionError("Illegal generic_setup, expected all arguments to by jlvaluet, found $(string(v)), within $(vals), orig=$(string(orig))"))
+       end
+    end
+    
     cal = emit_apply_generic!(B, vals)
 
     debug_from_orig!(gutils, cal, orig)
@@ -1950,6 +2060,7 @@ function generic_setup(
 end
 
 function common_generic_fwd(offset, B, orig, gutils, normalR, shadowR)
+    enzyme_ctx = enzyme_context()
     normal =
         (unsafe_load(normalR) != C_NULL) ? LLVM.Instruction(unsafe_load(normalR)) : nothing
     shadow =
@@ -1983,6 +2094,7 @@ function common_generic_fwd(offset, B, orig, gutils, normalR, shadowR)
         offset,
         B,
         false,
+        enzyme_ctx,
     ) #=start=#
     AT = LLVM.ArrayType(T_prjlvalue, 1 + Int(width))
     if unsafe_load(shadowR) != C_NULL
@@ -2030,6 +2142,7 @@ end
 end
 
 function common_generic_augfwd(offset, B, orig, gutils, normalR, shadowR, tapeR)
+    enzyme_ctx = enzyme_context()
     normal =
         (unsafe_load(normalR) != C_NULL) ? LLVM.Instruction(unsafe_load(normalR)) : nothing
     shadow =
@@ -2062,6 +2175,7 @@ function common_generic_augfwd(offset, B, orig, gutils, normalR, shadowR, tapeR)
         offset,
         B,
         false,
+        enzyme_ctx,
     ) #=start=#
     AT = LLVM.ArrayType(T_prjlvalue, 2 + Int(width))
 
@@ -2113,12 +2227,24 @@ end
     conv = LLVM.callconv(orig)
     # https://github.com/JuliaLang/julia/blob/5162023b9b67265ddb0bbbc0f4bd6b225c429aa0/src/codegen_shared.h#L20
 
-    @assert conv == 37
+    if conv != 37
+        emit_error(B, orig, "Unexpected calling conv, got $conv, for $(string(orig))")
+
+        if !is_constant_value(gutils, orig)
+            width = get_width(gutils)
+            unsafe_store!(
+                shadowR,
+                UndefValue(LLVM.LLVMType(API.EnzymeGetShadowType(width, value_type(orig)))).ref,
+            )
+        end
+        return false
+    end
 
     common_generic_augfwd(1, B, orig, gutils, normalR, shadowR, tapeR)
 end
 
 function common_generic_rev(offset, B, orig, gutils, tape)::Cvoid
+    enzyme_ctx = enzyme_context()
     needsShadowP = Ref{UInt8}(0)
     needsPrimalP = Ref{UInt8}(0)
     activep = API.EnzymeGradientUtilsGetReturnDiffeType(
@@ -2136,7 +2262,7 @@ function common_generic_rev(offset, B, orig, gutils, tape)::Cvoid
 
     @assert tape !== C_NULL
     width = get_width(gutils)
-    generic_setup(orig, runtime_generic_rev, Nothing, gutils, offset, B, true; tape) #=start=#
+    generic_setup(orig, runtime_generic_rev, Nothing, gutils, offset, B, true, enzyme_ctx; tape) #=start=#
     return nothing
 end
 
@@ -2144,13 +2270,17 @@ end
     conv = LLVM.callconv(orig)
     # https://github.com/JuliaLang/julia/blob/5162023b9b67265ddb0bbbc0f4bd6b225c429aa0/src/codegen_shared.h#L20
 
-    @assert conv == 37
+    if conv != 37
+        emit_error(B, orig, "Unexpected calling conv, got $conv, for $(string(orig))")
+        return nothing
+    end
 
     common_generic_rev(1, B, orig, gutils, tape)
     return nothing
 end
 
 function common_apply_latest_fwd(offset, B, orig, gutils, normalR, shadowR)
+    enzyme_ctx = enzyme_context()
     needsShadowP = Ref{UInt8}(0)
     needsPrimalP = Ref{UInt8}(0)
     activep = API.EnzymeGradientUtilsGetReturnDiffeType(
@@ -2180,6 +2310,7 @@ function common_apply_latest_fwd(offset, B, orig, gutils, normalR, shadowR)
         offset + 1,
         B,
         false,
+        enzyme_ctx,
     ) #=start=#
 
     if unsafe_load(shadowR) != C_NULL
@@ -2221,6 +2352,7 @@ function common_apply_latest_fwd(offset, B, orig, gutils, normalR, shadowR)
 end
 
 function common_apply_latest_augfwd(offset, B, orig, gutils, normalR, shadowR, tapeR)
+    enzyme_ctx = enzyme_context()
     needsShadowP = Ref{UInt8}(0)
     needsPrimalP = Ref{UInt8}(0)
     activep = API.EnzymeGradientUtilsGetReturnDiffeType(
@@ -2250,6 +2382,7 @@ function common_apply_latest_augfwd(offset, B, orig, gutils, normalR, shadowR, t
         offset + 1,
         B,
         false,
+        enzyme_ctx,
     ) #=start=#
 
     if unsafe_load(shadowR) != C_NULL
@@ -2297,6 +2430,7 @@ function common_apply_latest_augfwd(offset, B, orig, gutils, normalR, shadowR, t
 end
 
 function common_apply_latest_rev(offset, B, orig, gutils, tape)::Cvoid
+    enzyme_ctx = enzyme_context()
     needsShadowP = Ref{UInt8}(0)
     needsPrimalP = Ref{UInt8}(0)
     activep = API.EnzymeGradientUtilsGetReturnDiffeType(
@@ -2313,7 +2447,7 @@ function common_apply_latest_rev(offset, B, orig, gutils, tape)::Cvoid
     end
     if !is_constant_value(gutils, orig) || !is_constant_inst(gutils, orig)
         width = get_width(gutils)
-        generic_setup(orig, runtime_generic_rev, Nothing, gutils, offset + 1, B, true; tape) #=start=#
+        generic_setup(orig, runtime_generic_rev, Nothing, gutils, offset + 1, B, true, enzyme_ctx; tape) #=start=#
     end
 
     return nothing
@@ -2344,7 +2478,27 @@ end
     return nothing
 end
 
+# `invoke_in_world(world, f, args...)` (`_call_in_world` before Julia 1.12) is
+# `_call_latest` with the world in front; the runtime-generic path calls `f`
+# in the current world, as it does for `_call_latest`.
+@register_fwd function invoke_in_world_fwd(B, orig, gutils, normalR, shadowR)
+    @assert LLVM.callconv(orig) == 37
+    return common_apply_latest_fwd(2, B, orig, gutils, normalR, shadowR)
+end
+
+@register_aug function invoke_in_world_augfwd(B, orig, gutils, normalR, shadowR, tapeR)
+    @assert LLVM.callconv(orig) == 37
+    return common_apply_latest_augfwd(2, B, orig, gutils, normalR, shadowR, tapeR)
+end
+
+@register_rev function invoke_in_world_rev(B, orig, gutils, tape)
+    @assert LLVM.callconv(orig) == 37
+    common_apply_latest_rev(2, B, orig, gutils, tape)
+    return nothing
+end
+
 function common_apply_iterate_fwd(offset, B, orig, gutils, normalR, shadowR)
+    enzyme_ctx = enzyme_context()
     needsShadowP = Ref{UInt8}(0)
     needsPrimalP = Ref{UInt8}(0)
     activep = API.EnzymeGradientUtilsGetReturnDiffeType(
@@ -2360,8 +2514,10 @@ function common_apply_iterate_fwd(offset, B, orig, gutils, normalR, shadowR)
         return true
     end
 
-    v, isiter = absint(operands(orig)[offset+1])
-    v2, istup = absint(operands(orig)[offset+2])
+    v, isiter = absint(operands(orig)[offset + 1], enzyme_ctx)
+    isiter = unbind(isiter)
+    v2, istup = absint(operands(orig)[offset + 2], enzyme_ctx)
+    istup = unbind(istup)
 
     width = get_width(gutils)
 
@@ -2370,7 +2526,7 @@ function common_apply_iterate_fwd(offset, B, orig, gutils, normalR, shadowR)
        isiter == Base.iterate &&
        istup == Base.tuple &&
        length(operands(orig)) >= offset + 4
-        origops = collect(operands(orig)[1:end-1])
+        origops = arg_operands_view(orig)
         shadowins =
             [invert_pointer(gutils, origops[i], B) for i = (offset+3):length(origops)]
         shadowres = if width == 1
@@ -2382,7 +2538,7 @@ function common_apply_iterate_fwd(offset, B, orig, gutils, normalR, shadowR)
                     push!(newops, shadowin2)
                     push!(newvals, API.VT_Shadow)
                 else
-                    push!(newops, new_from_original(gutils, origops[i]))
+                    push!(newops, new_from_original(gutils, v))
                     push!(newvals, API.VT_Primal)
                 end
             end
@@ -2408,7 +2564,7 @@ function common_apply_iterate_fwd(offset, B, orig, gutils, normalR, shadowR)
                         push!(newops, shadowin2)
                         push!(newvals, API.VT_Shadow)
                     else
-                        push!(newops, new_from_original(gutils, origops[i]))
+                        push!(newops, new_from_original(gutils, v))
                         push!(newvals, API.VT_Primal)
                     end
                 end
@@ -2442,6 +2598,7 @@ function common_apply_iterate_fwd(offset, B, orig, gutils, normalR, shadowR)
             offset + 2,
             B,
             false,
+            enzyme_ctx,
         ) #=start=#
         AT = LLVM.ArrayType(T_prjlvalue, 1 + Int(width))
         if unsafe_load(shadowR) != C_NULL
@@ -2496,6 +2653,7 @@ function common_apply_iterate_fwd(offset, B, orig, gutils, normalR, shadowR)
 end
 
 function common_apply_iterate_augfwd(offset, B, orig, gutils, normalR, shadowR, tapeR)
+    enzyme_ctx = enzyme_context()
     needsShadowP = Ref{UInt8}(0)
     needsPrimalP = Ref{UInt8}(0)
     activep = API.EnzymeGradientUtilsGetReturnDiffeType(
@@ -2511,8 +2669,10 @@ function common_apply_iterate_augfwd(offset, B, orig, gutils, normalR, shadowR, 
         return true
     end
 
-    v, isiter = absint(operands(orig)[offset+1])
-    v2, istup = absint(operands(orig)[offset+2])
+    v, isiter = absint(operands(orig)[offset + 1], enzyme_ctx)
+    v2, istup = absint(operands(orig)[offset + 2], enzyme_ctx)
+    isiter = unbind(isiter)
+    istup = unbind(istup)
 
     width = get_width(gutils)
 
@@ -2528,6 +2688,7 @@ function common_apply_iterate_augfwd(offset, B, orig, gutils, normalR, shadowR, 
             offset + 2,
             B,
             false,
+            enzyme_ctx,
         ) #=start=#
         AT = LLVM.ArrayType(T_prjlvalue, 2 + Int(width))
 
@@ -2600,6 +2761,7 @@ function common_apply_iterate_augfwd(offset, B, orig, gutils, normalR, shadowR, 
 end
 
 function common_apply_iterate_rev(offset, B, orig, gutils, tape)
+    enzyme_ctx = enzyme_context()
     needsShadowP = Ref{UInt8}(0)
     needsPrimalP = Ref{UInt8}(0)
     activep = API.EnzymeGradientUtilsGetReturnDiffeType(
@@ -2617,7 +2779,7 @@ function common_apply_iterate_rev(offset, B, orig, gutils, tape)
 
     @assert tape !== C_NULL
     width = get_width(gutils)
-    generic_setup(orig, runtime_iterate_rev, Nothing, gutils, offset + 2, B, true; tape) #=start=#
+    generic_setup(orig, runtime_iterate_rev, Nothing, gutils, offset + 2, B, true, enzyme_ctx; tape) #=start=#
     return nothing
 end
 
@@ -2635,6 +2797,7 @@ end
 end
 
 function common_invoke_fwd(offset, B, orig, gutils, normalR, shadowR)
+    enzyme_ctx = enzyme_context()
     needsShadowP = Ref{UInt8}(0)
     needsPrimalP = Ref{UInt8}(0)
     activep = API.EnzymeGradientUtilsGetReturnDiffeType(
@@ -2662,6 +2825,7 @@ function common_invoke_fwd(offset, B, orig, gutils, normalR, shadowR)
         offset + 1,
         B,
         false,
+        enzyme_ctx,
     ) #=start=#
     AT = LLVM.ArrayType(T_prjlvalue, 1 + Int(width))
 
@@ -2704,6 +2868,7 @@ function common_invoke_fwd(offset, B, orig, gutils, normalR, shadowR)
 end
 
 function common_invoke_augfwd(offset, B, orig, gutils, normalR, shadowR, tapeR)
+    enzyme_ctx = enzyme_context()
     needsShadowP = Ref{UInt8}(0)
     needsPrimalP = Ref{UInt8}(0)
     activep = API.EnzymeGradientUtilsGetReturnDiffeType(
@@ -2737,6 +2902,7 @@ function common_invoke_augfwd(offset, B, orig, gutils, normalR, shadowR, tapeR)
         offset + 1,
         B,
         false,
+        enzyme_ctx,
     ) #=start=#
     AT = LLVM.ArrayType(T_prjlvalue, 2 + Int(width))
 
@@ -2786,6 +2952,7 @@ function common_invoke_augfwd(offset, B, orig, gutils, normalR, shadowR, tapeR)
 end
 
 function common_invoke_rev(offset, B, orig, gutils, tape)
+    enzyme_ctx = enzyme_context()
     needsShadowP = Ref{UInt8}(0)
     needsPrimalP = Ref{UInt8}(0)
     activep = API.EnzymeGradientUtilsGetReturnDiffeType(
@@ -2802,7 +2969,7 @@ function common_invoke_rev(offset, B, orig, gutils, tape)
     end
 
     width = get_width(gutils)
-    generic_setup(orig, runtime_generic_rev, Nothing, gutils, offset + 1, B, true; tape) #=start=#
+    generic_setup(orig, runtime_generic_rev, Nothing, gutils, offset + 1, B, true, enzyme_ctx; tape) #=start=#
 
     return nothing
 end

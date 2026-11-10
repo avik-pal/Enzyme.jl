@@ -15,7 +15,10 @@ using Test
     R = Float64[0., 0.]
     dR = Float64[2., 3.]
 
-    @test 5.0 ≈ Enzyme.autodiff(Reverse, tasktest, Duplicated(R, dR), Active(2.0))[1][2]
+    # We define the local variable `autodiff` as a `Ref` wrapper only to be able to capture
+    # and test the warning emitted by the `@generated` function `Enzyme.autodiff`.
+    autodiff = Ref{Any}(Enzyme.autodiff)
+    @test 5.0 ≈ @test_warn r"active variables passed by value to jl_new_task are not yet supported" autodiff[](Reverse, tasktest, Duplicated(R, dR), Active(2.0))[1][2]
     @test Float64[2.0, 2.0] ≈ R
     @test Float64[0.0, 0.0] ≈ dR
     
@@ -30,7 +33,7 @@ using Test
         nothing
     end
     # The empty return previously resulted in an illegal instruction error
-    @test 0.0 ≈ Enzyme.autodiff(Reverse, tasktest2, Duplicated(R, dR), Active(2.0))[1][2]
+    @test 0.0 ≈ @test_warn r"active variables passed by value to jl_new_task are not yet supported" autodiff[](Reverse, tasktest2, Duplicated(R, dR), Active(2.0))[1][2]
     @test () === Enzyme.autodiff(Forward, tasktest, Duplicated(R, dR), Duplicated(2.0, 1.0))
 end
 
@@ -150,4 +153,66 @@ end
     @test ty[2] ≈ [6.0, 6.0]
     @test ty[3] ≈ [8.0, 8.0]
     @test ty[4] ≈ [10.0, 10.0]
+end
+
+@testset "GEP non-inline type analysis" begin
+    function spread_no_broadcast!(bufs, q, ::Val{N}) where N
+        Threads.@threads for t in 1:N
+            for i in t:N:length(q)
+                @inbounds bufs[t][i, i + 1, i + 2] += q[i]
+            end
+        end
+        return sum(sum, bufs)
+    end
+
+    q = [1.0, 2.0]
+    dq = [0.0, 0.0]
+    bufs = [zeros(4, 4, 4) for _ in 1:2]
+    dbufs = [zeros(4, 4, 4) for _ in 1:2]
+
+    autodiff(ReverseWithPrimal, spread_no_broadcast!, Active, Duplicated(bufs, dbufs),
+             Duplicated(q, dq), Const(Val(2)))
+    @test dq ≈ [1.0, 1.0]
+end
+
+
+@testset "Forward constant captured by threads closure" begin
+    function thr_const_capture(x, a)
+        y = zeros(length(x))
+        Threads.@threads for i in eachindex(x)
+            y[i] = a * x[i]
+        end
+        return sum(y)
+    end
+    thr_const_local(x) = thr_const_capture(x, 2.0)
+
+    x = [1.0, 2.0, 3.0, 4.0]
+    @test 8.0 ≈ autodiff(Forward, thr_const_local, Duplicated(copy(x), ones(4)))[1]
+    @test 0.0 ≈ autodiff(Forward, thr_const_local, Duplicated(copy(x), zeros(4)))[1]
+    @test 8.0 ≈ autodiff(Forward, thr_const_capture, Duplicated(copy(x), ones(4)), Const(2.0))[1]
+    @test 10.0 ≈ autodiff(Forward, thr_const_capture, Duplicated(copy(x), zeros(4)), Duplicated(2.0, 1.0))[1]
+    res = autodiff(Forward, thr_const_local, BatchDuplicated(copy(x), (ones(4), 2 .* ones(4))))[1]
+    @test 8.0 ≈ res[1]
+    @test 16.0 ≈ res[2]
+end
+
+@testset "Threads.@spawn with active-by-value closure capture (#3226)" begin
+    function f_spawn_unused(x)
+        y = (x, 2.0)
+        t = Threads.@spawn y[1]^2
+        wait(t)
+        return y[1]
+    end
+    function f_spawn_active(x)
+        r = Ref(0.0)
+        y = (x, 2.0)
+        t = Threads.@spawn begin
+            r[] = y[1]^2 * y[2]
+            nothing
+        end
+        wait(t)
+        return r[]
+    end
+    @test only(only(autodiff(set_runtime_activity(Reverse), f_spawn_unused, Active, Active(2.0)))) ≈ 1.0
+    @test only(only(autodiff(set_runtime_activity(Reverse), f_spawn_active, Active, Active(3.0)))) ≈ 12.0
 end
