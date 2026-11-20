@@ -1,15 +1,15 @@
 # For julia runtime function emission
-    
+
 function emit_allocobj!(
-    B::LLVM.IRBuilder,
-    @nospecialize(tag::LLVM.Value),
-    @nospecialize(Size::LLVM.Value),
-    needs_workaround::Bool,
-    name::String = "",
-)
-    curent_bb = position(B)
-    fn = LLVM.parent(curent_bb)
-    mod = LLVM.parent(fn)
+        B::LLVM.IRBuilder,
+        @nospecialize(tag::LLVM.Value),
+        @nospecialize(Size::LLVM.Value),
+        needs_workaround::Bool,
+        name::String = "",
+    )
+    curent_bb = B.insert_block
+    fn = curent_bb.parent
+    mod = fn.parent
 
     T_jlvalue = LLVM.StructType(LLVMType[])
     T_pjlvalue = LLVM.PointerType(T_jlvalue)
@@ -20,14 +20,17 @@ function emit_allocobj!(
     T_pint8 = LLVM.PointerType(T_int8)
 
     pgcstack = reinsert_gcmarker!(fn, B)
+    bc = bitcast!(B, pgcstack, T_ppjlvalue, pgcstack.name * "_bc")
+
     ct = inbounds_gep!(
         B,
         T_pjlvalue,
-        bitcast!(B, pgcstack, T_ppjlvalue),
+        bc,
         [LLVM.ConstantInt(current_task_offset())],
     )
 
-    @static if VERSION < v"1.11.0-"    
+
+    @static if VERSION < v"1.11.0-"
         ptls_field = inbounds_gep!(B, T_pjlvalue, ct, [LLVM.ConstantInt(current_ptls_offset())])
         T_ppint8 = LLVM.PointerType(T_pint8)
         ptls = load!(B, T_pint8, bitcast!(B, ptls_field, T_ppint8))
@@ -40,7 +43,7 @@ function emit_allocobj!(
         # This doesn't allow for optimizations
         alty = LLVM.FunctionType(T_prjlvalue, [T_pint8, T_size_t, T_prjlvalue])
         alloc_obj, _ = get_function!(mod, "jl_gc_alloc_typed", alty)
-        if value_type(Size) != T_size_t # Fix Int32/Int64 issues on 32bit systems
+        if Size.value_type != T_size_t # Fix Int32/Int64 issues on 32bit systems
             Size = trunc!(B, Size, T_size_t)
         end
         return call!(B, alty, alloc_obj, LLVM.Value[ptls, Size, tag])
@@ -59,9 +62,9 @@ function emit_allocobj!(
     return call!(B, alty, alloc_obj, LLVM.Value[ct, Size, tag], name)
 end
 function emit_allocobj!(B::LLVM.IRBuilder, @nospecialize(T::DataType), name::String = "")
-    curent_bb = position(B)
-    fn = LLVM.parent(curent_bb)
-    mod = LLVM.parent(fn)
+    curent_bb = B.insert_block
+    fn = curent_bb.parent
+    mod = fn.parent
 
     T_jlvalue = LLVM.StructType(LLVMType[])
     T_prjlvalue_UT = LLVM.PointerType(T_jlvalue)
@@ -72,78 +75,108 @@ function emit_allocobj!(B::LLVM.IRBuilder, @nospecialize(T::DataType), name::Str
 
     T_size_t = convert(LLVM.LLVMType, UInt)
     Size = LLVM.ConstantInt(T_size_t, sizeof(T))
-    emit_allocobj!(B, tag, Size, false, name) #=needs_workaround=#
+    return emit_allocobj!(B, tag, Size, false, name) #=needs_workaround=#
 end
 
-declare_pointerfromobjref!(mod::LLVM.Module) =
-    get_function!(mod, "julia.pointer_from_objref") do
+declare_pointerfromobjref!(mod::LLVM.Module) = begin
+    attrs = LLVM.Attribute[LLVM.EnumAttribute(:nounwind), LLVM.EnumAttribute(:willreturn)]
+    F, fty = get_function!(mod, "julia.pointer_from_objref", attrs; memory_effects = LLVM.MemoryEffects(:none)) do
         T_jlvalue = LLVM.StructType(LLVMType[])
         T_prjlvalue = LLVM.PointerType(T_jlvalue, Derived)
         T_pjlvalue = LLVM.PointerType(T_jlvalue)
         LLVM.FunctionType(T_pjlvalue, [T_prjlvalue])
     end
+    return F, fty
+end
 
 function emit_pointerfromobjref!(B::LLVM.IRBuilder, @nospecialize(T::LLVM.Value))
-    curent_bb = position(B)
-    fn = LLVM.parent(curent_bb)
-    mod = LLVM.parent(fn)
+    curent_bb = B.insert_block
+    fn = curent_bb.parent
+    mod = fn.parent
     func, fty = declare_pointerfromobjref!(mod)
     return call!(B, fty, func, [T])
 end
 
+# Since julia#62737 codegen emits `julia.object_write_barrier(parent, children...)` and the
+# field-aware `julia.field_write_barrier.p11/.p13(parent, slot, child, ...)` instead of
+# `julia.write_barrier(parent, children...)`, which Julia no longer lowers.
+const WRITE_BARRIER = @static if VERSION >= v"1.14.0-DEV.3304"
+    "julia.object_write_barrier"
+else
+    "julia.write_barrier"
+end
+
 declare_writebarrier!(mod::LLVM.Module) =
-    get_function!(mod, "julia.write_barrier") do
-        T_jlvalue = LLVM.StructType(LLVMType[])
-        T_prjlvalue = LLVM.PointerType(T_jlvalue, Tracked)
-        LLVM.FunctionType(LLVM.VoidType(), [T_prjlvalue]; vararg = true)
+    get_function!(mod, WRITE_BARRIER) do
+    T_jlvalue = LLVM.StructType(LLVMType[])
+    T_prjlvalue = LLVM.PointerType(T_jlvalue, Tracked)
+    LLVM.FunctionType(LLVM.VoidType(), [T_prjlvalue]; vararg = true)
+end
+
+# Enzyme emits `julia.write_barrier` into modules that had no julia#62737 barrier to
+# take the name from. Rename those to `julia.object_write_barrier`, which has the same
+# signature, before Julia's GC lowering runs.
+function modern_write_barriers!(mod::LLVM.Module)
+    @static if VERSION >= v"1.14.0-DEV.3304"
+        fns = mod.functions
+        haskey(fns, "julia.write_barrier") || return
+        wb = fns["julia.write_barrier"]
+        if haskey(fns, "julia.object_write_barrier")
+            replace_uses!(wb, fns["julia.object_write_barrier"])
+            erase!(wb)
+        else
+            wb.name = "julia.object_write_barrier"
+        end
     end
+    return
+end
 declare_apply_generic!(mod::LLVM.Module) =
     get_function!(mod, "ijl_apply_generic") do
-        T_jlvalue = LLVM.StructType(LLVMType[])
-        T_prjlvalue = LLVM.PointerType(T_jlvalue, Tracked)
-        LLVM.FunctionType(
-            T_prjlvalue,
-            [T_prjlvalue, LLVM.PointerType(T_prjlvalue), LLVM.Int32Type()],
-        )
-    end
+    T_jlvalue = LLVM.StructType(LLVMType[])
+    T_prjlvalue = LLVM.PointerType(T_jlvalue, Tracked)
+    LLVM.FunctionType(
+        T_prjlvalue,
+        [T_prjlvalue, LLVM.PointerType(T_prjlvalue), LLVM.Int32Type()],
+    )
+end
 declare_juliacall!(mod::LLVM.Module) =
     get_function!(mod, "julia.call") do
-        T_jlvalue = LLVM.StructType(LLVMType[])
-        T_prjlvalue = LLVM.PointerType(T_jlvalue, Tracked)
-        LLVM.FunctionType(T_prjlvalue, [T_prjlvalue]; vararg = true)
-    end
+    T_jlvalue = LLVM.StructType(LLVMType[])
+    T_prjlvalue = LLVM.PointerType(T_jlvalue, Tracked)
+    LLVM.FunctionType(T_prjlvalue, [T_prjlvalue]; vararg = true)
+end
 
 function emit_jl!(B::LLVM.IRBuilder, @nospecialize(val::LLVM.Value))::LLVM.Value
-    curent_bb = position(B)
-    fn = LLVM.parent(curent_bb)
-    mod = LLVM.parent(fn)
+    curent_bb = B.insert_block
+    fn = curent_bb.parent
+    mod = fn.parent
     T_jlvalue = LLVM.StructType(LLVMType[])
     T_prjlvalue = LLVM.PointerType(T_jlvalue, Tracked)
     FT = LLVM.FunctionType(T_prjlvalue, [T_prjlvalue])
     fn, _ = get_function!(mod, "jl_", FT)
-    call!(B, FT, fn, LLVM.Value[val])
+    return call!(B, FT, fn, LLVM.Value[val])
 end
 
 function emit_jl_isa!(B::LLVM.IRBuilder, @nospecialize(val::LLVM.Value), @nospecialize(ty::LLVM.Value))::LLVM.Value
-    curent_bb = position(B)
-    fn = LLVM.parent(curent_bb)
-    mod = LLVM.parent(fn)
+    curent_bb = B.insert_block
+    fn = curent_bb.parent
+    mod = fn.parent
     T_jlvalue = LLVM.StructType(LLVMType[])
     T_prjlvalue = LLVM.PointerType(T_jlvalue, Tracked)
-    ity = LLVM.IntType(8*sizeof(Int))
+    ity = LLVM.IntType(8 * sizeof(Int))
     FT = LLVM.FunctionType(ity, [T_prjlvalue, T_prjlvalue])
     fn, _ = get_function!(mod, "jl_isa", FT)
-    call!(B, FT, fn, LLVM.Value[val, ty])
+    return call!(B, FT, fn, LLVM.Value[val, ty])
 end
 
 function emit_jl_isa!(B::LLVM.IRBuilder, @nospecialize(val::LLVM.Value), @nospecialize(ty::Type))::LLVM.Value
-    emit_jl_isa!(B, val, unsafe_to_llvm(B, ty))
+    return emit_jl_isa!(B, val, unsafe_to_llvm(B, ty))
 end
 
 function emit_getfield!(B::LLVM.IRBuilder, @nospecialize(val::LLVM.Value), @nospecialize(fld::LLVM.Value))::LLVM.Value
-    curent_bb = position(B)
-    fn = LLVM.parent(curent_bb)
-    mod = LLVM.parent(fn)
+    curent_bb = B.insert_block
+    fn = curent_bb.parent
+    mod = fn.parent
 
     T_jlvalue = LLVM.StructType(LLVMType[])
     T_prjlvalue = LLVM.PointerType(T_jlvalue, Tracked)
@@ -171,9 +204,9 @@ end
 
 
 function emit_nthfield!(B::LLVM.IRBuilder, @nospecialize(val::LLVM.Value), @nospecialize(fld::LLVM.Value))::LLVM.Value
-    curent_bb = position(B)
-    fn = LLVM.parent(curent_bb)
-    mod = LLVM.parent(fn)
+    curent_bb = B.insert_block
+    fn = curent_bb.parent
+    mod = fn.parent
 
     T_jlvalue = LLVM.StructType(LLVMType[])
     T_prjlvalue = LLVM.PointerType(T_jlvalue, Tracked)
@@ -183,77 +216,73 @@ function emit_nthfield!(B::LLVM.IRBuilder, @nospecialize(val::LLVM.Value), @nosp
     inv, _ = get_function!(mod, "jl_get_nth_field_checked", gen_FT)
 
     args = LLVM.Value[val, fld]
-    call!(B, gen_FT, inv, args)
+    return call!(B, gen_FT, inv, args)
 end
 
 function emit_nthfield!(B::LLVM.IRBuilder, @nospecialize(val::LLVM.Value), fld::Int)::LLVM.Value
-	emit_nthfield!(B, val, LLVM.ConstantInt(fld))
+    return emit_nthfield!(B, val, LLVM.ConstantInt(fld))
 end
 
 function emit_jl_throw!(B::LLVM.IRBuilder, @nospecialize(val::LLVM.Value))::LLVM.Value
-    curent_bb = position(B)
-    fn = LLVM.parent(curent_bb)
-    mod = LLVM.parent(fn)
+    curent_bb = B.insert_block
+    fn = curent_bb.parent
+    mod = fn.parent
     T_void = LLVM.VoidType()
     T_jlvalue = LLVM.StructType(LLVMType[])
     T_prjlvalue = LLVM.PointerType(T_jlvalue, 12)
     FT = LLVM.FunctionType(T_void, [T_prjlvalue])
     fn, _ = get_function!(mod, "jl_throw", FT)
     cb = call!(B, FT, fn, LLVM.Value[val])
-    LLVM.API.LLVMAddCallSiteAttribute(
-		cb,
-		reinterpret(LLVM.API.LLVMAttributeIndex, LLVM.API.LLVMAttributeFunctionIndex),
-		EnumAttribute("noreturn"),
-	    )
+    push!(cb.function_attributes, EnumAttribute(:noreturn))
     return cb
 end
 
 function emit_conditional_throw!(B::LLVM.IRBuilder, @nospecialize(cond::LLVM.Value), @nospecialize(errty::Type), @nospecialize(str::LLVM.Value))::LLVM.Value
-    curent_bb = position(B)
-    fn = LLVM.parent(curent_bb)
-    mod = LLVM.parent(fn)
+    curent_bb = B.insert_block
+    fn = curent_bb.parent
+    mod = fn.parent
     T_void = LLVM.VoidType()
     T_jlvalue = LLVM.StructType(LLVMType[])
     T_prjlvalue = LLVM.PointerType(T_jlvalue, 10)
     strty = LLVM.PointerType(LLVM.Int8Type())
     FT = LLVM.FunctionType(T_void, [strty, LLVM.IntType(1)])
 
-    name = "jl_conditional_throw_"*string(errty)
-    if haskey(functions(mod), name)
-        fn = functions(mod)[name]
+    name = "jl_conditional_throw_" * string(errty)
+    if haskey(mod.functions, name)
+        fn = mod.functions[name]
     else
         fn = LLVM.Function(mod, name, FT)
-    	linkage!(fn, LLVM.API.LLVMInternalLinkage)
-        rstr, rcond = LLVM.parameters(fn)
-	 builder = LLVM.IRBuilder()
-         entry = BasicBlock(fn, "entry")
-         errb = BasicBlock(fn, "err")
-         exitb = BasicBlock(fn, "errb")
-         position!(builder, entry)
-	 br!(builder, rcond, errb, exitb)
-         position!(builder, errb)
+        fn.linkage = LLVM.Linkage.Internal
+        rstr, rcond = fn.parameters
+        builder = LLVM.IRBuilder()
+        entry = BasicBlock(fn, "entry")
+        errb = BasicBlock(fn, "err")
+        exitb = BasicBlock(fn, "errb")
+        position!(builder, LLVM.at_end(entry))
+        br!(builder, rcond, errb, exitb)
+        position!(builder, LLVM.at_end(errb))
 
         err = emit_allocobj!(builder, errty)
         err2 = bitcast!(builder, err, LLVM.PointerType(LLVM.PointerType(LLVM.Int8Type()), 10))
         err2 = addrspacecast!(builder, err2, LLVM.PointerType(LLVM.PointerType(LLVM.Int8Type()), Derived))
         store!(builder, rstr, err2)
 
-    	 err = addrspacecast!(builder, err, LLVM.PointerType(T_jlvalue, 12))
-	   thrown = emit_jl_throw!(builder, err)
-	 unreachable!(builder)
-	 position!(builder, exitb)
-	 ret!(builder)
+        err = addrspacecast!(builder, err, LLVM.PointerType(T_jlvalue, 12))
+        thrown = emit_jl_throw!(builder, err)
+        unreachable!(builder)
+        position!(builder, LLVM.at_end(exitb))
+        ret!(builder)
 
-        push!(LLVM.function_attributes(fn), LLVM.EnumAttribute("alwaysinline", 0))
+        push!(fn.function_attributes, LLVM.EnumAttribute(:alwaysinline))
     end
 
-    call!(B, FT, fn, LLVM.Value[str, cond])
+    return call!(B, FT, fn, LLVM.Value[str, cond])
 end
 
 function emit_box_int32!(B::LLVM.IRBuilder, @nospecialize(val::LLVM.Value))::LLVM.Value
-    curent_bb = position(B)
-    fn = LLVM.parent(curent_bb)
-    mod = LLVM.parent(fn)
+    curent_bb = B.insert_block
+    fn = curent_bb.parent
+    mod = fn.parent
 
     T_jlvalue = LLVM.StructType(LLVMType[])
     T_prjlvalue = LLVM.PointerType(T_jlvalue, Tracked)
@@ -261,13 +290,13 @@ function emit_box_int32!(B::LLVM.IRBuilder, @nospecialize(val::LLVM.Value))::LLV
 
     FT = LLVM.FunctionType(T_prjlvalue, [T_int32])
     box_int32, _ = get_function!(mod, "ijl_box_int32", FT)
-    call!(B, FT, box_int32, LLVM.Value[val])
+    return call!(B, FT, box_int32, LLVM.Value[val])
 end
 
 function emit_box_int64!(B::LLVM.IRBuilder, @nospecialize(val::LLVM.Value))::LLVM.Value
-    curent_bb = position(B)
-    fn = LLVM.parent(curent_bb)
-    mod = LLVM.parent(fn)
+    curent_bb = B.insert_block
+    fn = curent_bb.parent
+    mod = fn.parent
 
     T_jlvalue = LLVM.StructType(LLVMType[])
     T_prjlvalue = LLVM.PointerType(T_jlvalue, Tracked)
@@ -275,13 +304,13 @@ function emit_box_int64!(B::LLVM.IRBuilder, @nospecialize(val::LLVM.Value))::LLV
 
     FT = LLVM.FunctionType(T_prjlvalue, [T_int64])
     box_int64, _ = get_function!(mod, "ijl_box_int64", FT)
-    call!(B, FT, box_int64, [val])
+    return call!(B, FT, box_int64, [val])
 end
 
 function emit_apply_generic!(B::LLVM.IRBuilder, args::Vector{LLVM.Value})::LLVM.Value
-    curent_bb = position(B)
-    fn = LLVM.parent(curent_bb)
-    mod = LLVM.parent(fn)
+    curent_bb = B.insert_block
+    fn = curent_bb.parent
+    mod = fn.parent
 
     T_jlvalue = LLVM.StructType(LLVMType[])
     T_prjlvalue = LLVM.PointerType(T_jlvalue, Tracked)
@@ -301,19 +330,19 @@ function emit_apply_generic!(B::LLVM.IRBuilder, args::Vector{LLVM.Value})::LLVM.
             vararg = true,
         ),
     )
-    nargs = Vector{LLVM.Value}(undef, 1+length(args))
+    nargs = Vector{LLVM.Value}(undef, 1 + length(args))
     nargs[1] = inv
     for (i, v) in enumerate(args)
-        nargs[1+i] = v
+        nargs[1 + i] = v
     end
     res = call!(B, FT, julia_call, nargs)
     return res
 end
 
 function emit_invoke!(B::LLVM.IRBuilder, args::Vector{LLVM.Value})::LLVM.Value
-    curent_bb = position(B)
-    fn = LLVM.parent(curent_bb)
-    mod = LLVM.parent(fn)
+    curent_bb = B.insert_block
+    fn = curent_bb.parent
+    mod = fn.parent
 
     T_jlvalue = LLVM.StructType(LLVMType[])
     T_prjlvalue = LLVM.PointerType(T_jlvalue, Tracked)
@@ -335,19 +364,19 @@ function emit_invoke!(B::LLVM.IRBuilder, args::Vector{LLVM.Value})::LLVM.Value
             vararg = true,
         ),
     )
-    nargs = Vector{LLVM.Value}(undef, 1+length(args))
+    nargs = Vector{LLVM.Value}(undef, 1 + length(args))
     nargs[1] = inv
     for (i, v) in enumerate(args)
-        nargs[1+i] = v
+        nargs[1 + i] = v
     end
     res = call!(B, FT, julia_call, nargs)
     return res
 end
 
 function emit_svec!(B::LLVM.IRBuilder, args::Vector{LLVM.Value})::LLVM.Value
-    curent_bb = position(B)
-    fn = LLVM.parent(curent_bb)
-    mod = LLVM.parent(fn)
+    curent_bb = B.insert_block
+    fn = curent_bb.parent
+    mod = fn.parent
 
     fn, fty = get_function!(mod, "jl_svec")
     sz = convert(LLVMType, Csize_t)
@@ -356,13 +385,13 @@ function emit_svec!(B::LLVM.IRBuilder, args::Vector{LLVM.Value})::LLVM.Value
     LLVM.FunctionType(T_prjlvalue, [sz]; vararg = true)
 
     sz = convert(LLVMType, Csize_t)
-    
-    nargs = Vector{LLVM.Value}(undef, 1+length(args))
+
+    nargs = Vector{LLVM.Value}(undef, 1 + length(args))
     nargs[1] = LLVM.ConstantInt(sz, length(args))
     for (i, v) in enumerate(args)
-        nargs[1+i] = v
+        nargs[1 + i] = v
     end
-    call!(B, fty, fn, nargs)
+    return call!(B, fty, fn, nargs)
 end
 
 
@@ -374,79 +403,69 @@ function load_if_mixed(oval::OT, val::VT) where {OT, VT}
     end
 end
 
-function val_from_byref_if_mixed(B::LLVM.IRBuilder, gutils::GradientUtils, @nospecialize(oval::LLVM.Value), @nospecialize(val::LLVM.Value))::LLVM.Value
-    world = enzyme_extract_world(LLVM.parent(position(B)))
-    legal, TT, _ = abs_typeof(oval)
+function val_from_byref_if_mixed(B::LLVM.IRBuilder, gutils::GradientUtils, @nospecialize(oval::LLVM.Value), @nospecialize(val::LLVM.Value), enzyme_ctx::Union{EnzymeContext, Nothing})::LLVM.Value
+    world = enzyme_world()
+    legal, TT, _ = abs_typeof(oval, enzyme_ctx)
     if !legal
-        legal, TT, _ = abs_typeof(oval, true)
+        legal, TT, _ = abs_typeof(oval, enzyme_ctx, true)
         if legal
-            act = active_reg_inner(TT, (), world)
-            if act == AnyState
+            if active_reg(TT, world) == AnyState
                 return val
             end
         end
-        return emit_apply_generic!(B, LLVM.Value[unsafe_to_llvm(B, load_if_mixed), new_from_original(gutils, oval), val]) 
+        return emit_apply_generic!(B, LLVM.Value[unsafe_to_llvm(B, load_if_mixed), new_from_original(gutils, oval), val])
     end
-    act = active_reg_inner(TT, (), world)
-    if act == ActiveState || act == MixedState
-        legal2, TT2, _ = abs_typeof(val)
+    if !guaranteed_nonactive(TT, world)
+        legal2, TT2, _ = abs_typeof(val, enzyme_ctx)
         if legal2
-	        @assert TT2 <: Base.RefValue
-	    else
-	    	shadowpointer = false
-	    	if isa(val, LLVM.PHIInst)
-	    		if size(incoming(val))[1] == 0
-	    			shadowpointer = true
-	    		end
-	    	elseif isa(val, LLVM.ExtractValueInst)
-	    		m = operands(val)[1]
-		    	if isa(m, LLVM.PHIInst)
-		    		if size(incoming(m))[1] == 0
-		    			shadowpointer = true
-		    		end
-		    	end
-	    	end
-	    	@assert shadowpointer
-	    end
+            @assert TT2 <: Base.RefValue
+        else
+            shadowpointer = false
+            if isa(val, LLVM.PHIInst)
+                if size(val.incoming)[1] == 0
+                    shadowpointer = true
+                end
+            elseif isa(val, LLVM.ExtractValueInst)
+                m = val.operands[1]
+                if isa(m, LLVM.PHIInst)
+                    if size(m.incoming)[1] == 0
+                        shadowpointer = true
+                    end
+                end
+            end
+            @assert shadowpointer
+        end
         return emit_nthfield!(B, val, 0)
     else
         return val
     end
 end
 
-@generated function ref_if_mixed(val::VT) where VT
-    areg = active_reg_inner(VT, (), nothing, Val(true)) 
-    if areg == ActiveState || areg == MixedState
-        quote
-            Base.@_inline_meta
-            Ref(val)
-        end
+@inline function ref_if_mixed(val::VT) where {VT}
+    areg = active_reg_nothrow(VT)
+    return if areg == ActiveState || areg == MixedState
+        Ref(val)
     else
-        quote
-            Base.@_inline_meta
-            val
-        end
+        val
     end
 end
 
-function byref_from_val_if_mixed(B::LLVM.IRBuilder, @nospecialize(val::LLVM.Value))::LLVM.Value
-    world = enzyme_extract_world(LLVM.parent(position(B)))
-    legal, TT, _ = abs_typeof(val)
+function byref_from_val_if_mixed(B::LLVM.IRBuilder, @nospecialize(val::LLVM.Value), enzyme_ctx::Union{EnzymeContext, Nothing})::LLVM.Value
+    world = enzyme_world()
+    legal, TT, _ = abs_typeof(val, enzyme_ctx)
     if !legal
-        legal, TT, _ = abs_typeof(val, true)
-        act = active_reg_inner(TT, (), world)
-        if legal && act == AnyState
+        legal, TT, _ = abs_typeof(val, enzyme_ctx, true)
+        if legal && active_reg(TT, world) == AnyState
             return val
         end
-        return emit_apply_generic!(B, LLVM.Value[unsafe_to_llvm(B, ref_if_mixed), val]) 
+        return emit_apply_generic!(B, LLVM.Value[unsafe_to_llvm(B, ref_if_mixed), val])
     end
-    act = active_reg_inner(TT, (), world)
-    
-    if act == ActiveState || act == MixedState
+
+    if !guaranteed_nonactive(TT, world)
         obj = emit_allocobj!(B, Base.RefValue{TT})
         lty = convert(LLVMType, TT)
-        ld = load!(B, lty, bitcast!(B, val, LLVM.PointerType(lty, addrspace(value_type(val)))))
-        store!(B, ld, bitcast!(B, obj, LLVM.PointerType(lty, addrspace(value_type(val)))))
+        ld = load!(B, lty, bitcast!(B, val, LLVM.PointerType(lty, val.value_type.addrspace)))
+        store!(B, ld, bitcast!(B, obj, LLVM.PointerType(lty, val.value_type.addrspace)))
         emit_writebarrier!(B, get_julia_inner_types(B, obj, ld))
         return obj
     else
@@ -454,17 +473,148 @@ function byref_from_val_if_mixed(B::LLVM.IRBuilder, @nospecialize(val::LLVM.Valu
     end
 end
 
-function emit_apply_type!(B::LLVM.IRBuilder, @nospecialize(Ty::Type), args::Vector{LLVM.Value})::LLVM.Value
-    curent_bb = position(B)
-    fn = LLVM.parent(curent_bb)
-    mod = LLVM.parent(fn)
+# Largest `count` for which `define_ntuple_type!` builds `NTuple{count, T}`
+# from a stack array; larger counts go through a heap-allocated svec.
+const NTUPLE_TYPE_STACK_SIZE = 64
+
+"""
+    declare_ntuple_type!(mod::LLVM.Module)
+
+Declare `julia.enzyme.ntuple_type(T, count)`, which returns `NTuple{count, T}`.
+It stays a bare declaration while Enzyme differentiates, including in the
+module kept for nested differentiation, so that no optimization drops its
+constant `T` argument and `abs_ntuple_type` can always recover `T`.
+`define_ntuple_type!` gives it a body after differentiation.
+"""
+function declare_ntuple_type!(mod::LLVM.Module)
+    T_jlvalue = LLVM.StructType(LLVMType[])
+    T_prjlvalue = LLVM.PointerType(T_jlvalue, Tracked)
+    T_size = convert(LLVMType, Int)
+    FT = LLVM.FunctionType(T_prjlvalue, [T_prjlvalue, T_size])
+    # The result depends only on the arguments and is interned, so the call can be
+    # treated as readnone, which also lets LLVM CSE it and hoist it out of loops.
+    fn, _ = get_function!(
+        mod, "julia.enzyme.ntuple_type", FT,
+        LLVM.Attribute[
+            EnumAttribute(:nounwind),
+            StringAttribute("enzyme_inactive"),
+            StringAttribute("enzyme_no_escaping_allocation"),
+        ];
+        memory_effects = LLVM.MemoryEffects(:none),
+    )
+    if isa(fn, LLVM.Function) && isempty(collect(fn.parameter_attributes[1]))
+        push!(fn.parameter_attributes[1], nocapture_attr())
+        push!(fn.parameter_attributes[1], EnumAttribute(:readonly))
+    end
+    return fn, FT
+end
+
+"""
+    define_ntuple_type!(mod::LLVM.Module)
+
+Give `julia.enzyme.ntuple_type`, if `mod` declares it, an `alwaysinline` body.
+For `count <= NTUPLE_TYPE_STACK_SIZE` it fills a stack array with `T` and calls
+`jl_apply_tuple_type_v`; otherwise it calls
+`jl_apply_tuple_type(jl_svec_fill(count, T))`. Both find the interned type
+several times faster than `jl_f_apply_type(NTuple, count, T)`, which first
+instantiates the `NTuple` `UnionAll`. Call this once differentiation is done,
+after the module for nested differentiation has been saved.
+"""
+function define_ntuple_type!(mod::LLVM.Module)
+    haskey(mod.functions, "julia.enzyme.ntuple_type") || return
+    fn = mod.functions["julia.enzyme.ntuple_type"]
+    isempty(fn.blocks) || return
+
+    T_jlvalue = LLVM.StructType(LLVMType[])
+    T_prjlvalue = LLVM.PointerType(T_jlvalue, Tracked)
+    T_pjlvalue = LLVM.PointerType(T_jlvalue)
+    T_size = convert(LLVMType, Int)
+
+    fn.linkage = LLVM.Linkage.Internal
+    push!(fn.function_attributes, EnumAttribute(:alwaysinline))
+
+    let builder = IRBuilder()
+        entry = BasicBlock(fn, "entry")
+        prefill = BasicBlock(fn, "prefill")
+        loop = BasicBlock(fn, "fill")
+        stack = BasicBlock(fn, "stack")
+        heap = BasicBlock(fn, "heap")
+        eltype, n = collect(fn.parameters)
+
+        position!(builder, LLVM.at_end(entry))
+        br!(builder, icmp!(builder, LLVM.IntPredicate.ULE, n, LLVM.ConstantInt(T_size, NTUPLE_TYPE_STACK_SIZE)), prefill, heap)
+
+        position!(builder, LLVM.at_end(prefill))
+        # `T` is a type, which is never freed, so the untracked slots need no rooting
+        # of their own; `T` itself is rooted across the call by `jl_roots`.
+        buf = array_alloca!(builder, T_pjlvalue, n, "ntuple_params")
+        raw = emit_pointerfromobjref!(builder, addrspacecast!(builder, eltype, LLVM.PointerType(T_jlvalue, Derived)))
+        br!(builder, icmp!(builder, LLVM.IntPredicate.EQ, n, LLVM.ConstantInt(T_size, 0)), stack, loop)
+
+        position!(builder, LLVM.at_end(loop))
+        idx = LLVM.phi!(builder, T_size, "idx")
+        store!(builder, raw, inbounds_gep!(builder, T_pjlvalue, buf, LLVM.Value[idx]))
+        next = add!(builder, idx, LLVM.ConstantInt(T_size, 1))
+        append!(idx.incoming, [(LLVM.ConstantInt(T_size, 0), prefill), (next, loop)])
+        br!(builder, icmp!(builder, LLVM.IntPredicate.ULT, next, n), loop, stack)
+
+        position!(builder, LLVM.at_end(stack))
+        memory = if LLVM.version().major <= 15
+            EnumAttribute(:inaccessiblemem_or_argmemonly)
+        else
+            EnumAttribute(LLVM.MemoryEffects(argmem = :read, inaccessiblemem = :readwrite))
+        end
+        apply_tuple_v, apply_tuple_v_FT = get_function!(
+            mod, "ijl_apply_tuple_type_v", LLVM.FunctionType(T_prjlvalue, [LLVM.PointerType(T_pjlvalue), T_size]),
+            LLVM.Attribute[memory, EnumAttribute(:nounwind)]
+        )
+        if isa(apply_tuple_v, LLVM.Function) && isempty(collect(apply_tuple_v.parameter_attributes[1]))
+            push!(apply_tuple_v.parameter_attributes[1], EnumAttribute(:readonly))
+            push!(apply_tuple_v.parameter_attributes[1], nocapture_attr())
+        end
+        roots = [LLVM.OperandBundle("jl_roots", LLVM.Value[eltype])]
+        ret!(builder, call!(builder, apply_tuple_v_FT, apply_tuple_v, LLVM.Value[buf, n], roots))
+
+        position!(builder, LLVM.at_end(heap))
+        svec_fill, svec_fill_FT = get_function!(mod, "ijl_svec_fill", LLVM.FunctionType(T_prjlvalue, [T_size, T_prjlvalue]))
+        params = call!(builder, svec_fill_FT, svec_fill, LLVM.Value[n, eltype])
+        tag = @static if VERSION >= v"1.11"
+            # The tape element type `T` is a valid type parameter, so skip the check.
+            T_int32 = LLVM.Int32Type()
+            apply_tuple, apply_tuple_FT = get_function!(mod, "ijl_apply_tuple_type", LLVM.FunctionType(T_prjlvalue, [T_prjlvalue, T_int32]))
+            call!(builder, apply_tuple_FT, apply_tuple, LLVM.Value[params, LLVM.ConstantInt(T_int32, 0)])
+        else
+            apply_tuple, apply_tuple_FT = get_function!(mod, "ijl_apply_tuple_type", LLVM.FunctionType(T_prjlvalue, [T_prjlvalue]))
+            call!(builder, apply_tuple_FT, apply_tuple, LLVM.Value[params])
+        end
+        ret!(builder, tag)
+        dispose(builder)
+    end
+    return
+end
+
+"""
+    emit_ntuple_type!(B, count, T) -> LLVM.Value
+
+Emit the type `NTuple{count, T}` for a runtime `count::Int` as a call to
+`julia.enzyme.ntuple_type` (see `declare_ntuple_type!` and `define_ntuple_type!`).
+"""
+function emit_ntuple_type!(B::LLVM.IRBuilder, @nospecialize(count::LLVM.Value), @nospecialize(T::Type))::LLVM.Value
+    fn, FT = declare_ntuple_type!(B.insert_block.parent.parent)
+    return call!(B, FT, fn, LLVM.Value[unsafe_to_llvm(B, T), count])
+end
+
+function emit_apply_type!(B::LLVM.IRBuilder, @nospecialize(Ty::Type), args::Vector{LLVM.Value}, enzyme_ctx::Union{EnzymeContext, Nothing})::LLVM.Value
+    curent_bb = B.insert_block
+    fn = curent_bb.parent
+    mod = fn.parent
 
     legal = true
     found = Any[]
     for arg in args
-        slegal, foundv = absint(arg)
+        slegal, foundv = absint(arg, enzyme_ctx)
         if slegal
-            push!(found, foundv)
+            push!(found, unbind(foundv))
         else
             legal = false
             break
@@ -493,12 +643,12 @@ function emit_apply_type!(B::LLVM.IRBuilder, @nospecialize(Ty::Type), args::Vect
             vararg = true,
         ),
     )
-    nargs = Vector{LLVM.Value}(undef, 3+length(args))
+    nargs = Vector{LLVM.Value}(undef, 3 + length(args))
     nargs[1] = f_apply_type
     nargs[2] = LLVM.PointerNull(T_prjlvalue)
     nargs[3] = unsafe_to_llvm(B, Ty)
     for (i, v) in enumerate(args)
-        nargs[3+i] = v
+        nargs[3 + i] = v
     end
     tag = call!(
         B,
@@ -509,17 +659,17 @@ function emit_apply_type!(B::LLVM.IRBuilder, @nospecialize(Ty::Type), args::Vect
     return tag
 end
 
-function emit_tuple!(B::LLVM.IRBuilder, args::Vector{LLVM.Value})::LLVM.Value
-    curent_bb = position(B)
-    fn = LLVM.parent(curent_bb)
-    mod = LLVM.parent(fn)
+function emit_tuple!(B::LLVM.IRBuilder, args::Vector{LLVM.Value}, enzyme_ctx::Union{EnzymeContext, Nothing})::LLVM.Value
+    curent_bb = B.insert_block
+    fn = curent_bb.parent
+    mod = fn.parent
 
     legal = true
     found = Any[]
     for arg in args
-        slegal, foundv = absint(arg)
+        slegal, foundv = absint(arg, enzyme_ctx)
         if slegal
-            push!(found, foundv)
+            push!(found, unbind(foundv))
         else
             legal = false
             break
@@ -548,11 +698,11 @@ function emit_tuple!(B::LLVM.IRBuilder, args::Vector{LLVM.Value})::LLVM.Value
             vararg = true,
         ),
     )
-    nargs = Vector{LLVM.Value}(undef, 2+length(args))
+    nargs = Vector{LLVM.Value}(undef, 2 + length(args))
     nargs[1] = f_apply_type
     nargs[2] = LLVM.PointerNull(T_prjlvalue)
     for (i, v) in enumerate(args)
-        nargs[2+i] = v
+        nargs[2 + i] = v
     end
     tag = call!(
         B,
@@ -563,12 +713,12 @@ function emit_tuple!(B::LLVM.IRBuilder, args::Vector{LLVM.Value})::LLVM.Value
     return tag
 end
 
-function emit_jltypeof!(B::LLVM.IRBuilder, @nospecialize(arg::LLVM.Value))::LLVM.Value
-    curent_bb = position(B)
-    fn = LLVM.parent(curent_bb)
-    mod = LLVM.parent(fn)
+function emit_jltypeof!(B::LLVM.IRBuilder, @nospecialize(arg::LLVM.Value), enzyme_ctx::Union{EnzymeContext, Nothing})::LLVM.Value
+    curent_bb = B.insert_block
+    fn = curent_bb.parent
+    mod = fn.parent
 
-    legal, val, byref = abs_typeof(arg)
+    legal, val, byref = abs_typeof(arg, enzyme_ctx)
     if legal
         return unsafe_to_llvm(B, val)
     end
@@ -577,26 +727,26 @@ function emit_jltypeof!(B::LLVM.IRBuilder, @nospecialize(arg::LLVM.Value))::LLVM
     T_prjlvalue = LLVM.PointerType(T_jlvalue, Tracked)
     FT = LLVM.FunctionType(T_prjlvalue, [T_prjlvalue]; vararg = true)
     fn, _ = get_function!(mod, "jl_typeof", FT)
-    call!(B, FT, fn, [arg])
+    return call!(B, FT, fn, [arg])
 end
 
-function emit_methodinstance!(B::LLVM.IRBuilder, @nospecialize(func), args::Vector{LLVM.Value})::LLVM.Value
-    curent_bb = position(B)
-    fn = LLVM.parent(curent_bb)
-    mod = LLVM.parent(fn)
+function emit_methodinstance!(B::LLVM.IRBuilder, @nospecialize(func), args::Vector{LLVM.Value}, enzyme_ctx::Union{EnzymeContext, Nothing})::LLVM.Value
+    curent_bb = B.insert_block
+    fn = curent_bb.parent
+    mod = fn.parent
 
-    world = enzyme_extract_world(fn)
+    world = enzyme_world()
 
     sizeT = convert(LLVMType, Csize_t)
     psizeT = LLVM.PointerType(sizeT)
 
     primalvaltys = LLVM.Value[unsafe_to_llvm(B, Core.Typeof(func))]
     for a in args
-        push!(primalvaltys, emit_jltypeof!(B, a))
+        push!(primalvaltys, emit_jltypeof!(B, a, enzyme_ctx))
     end
 
     meth = only(methods(func))
-    tag = emit_apply_type!(B, Tuple, primalvaltys)
+    tag = emit_apply_type!(B, Tuple, primalvaltys, enzyme_ctx)
 
     #    TT = meth.sig
     #    while TT isa UnionAll
@@ -621,7 +771,7 @@ function emit_methodinstance!(B::LLVM.IRBuilder, @nospecialize(func), args::Vect
         LLVM.FunctionType(T_prjlvalue, [T_prjlvalue, T_prjlvalue, sizeT, psizeT, psizeT]),
     )
     EB = LLVM.IRBuilder()
-    position!(EB, first(LLVM.instructions(LLVM.entry(fn))))
+    position!(EB, LLVM.at_begin(fn.entry))
     minworld = alloca!(EB, sizeT)
     maxworld = alloca!(EB, sizeT)
     store!(B, LLVM.ConstantInt(sizeT, 0), minworld)
@@ -664,13 +814,25 @@ function emit_methodinstance!(B::LLVM.IRBuilder, @nospecialize(func), args::Vect
 end
 
 function emit_writebarrier!(B::LLVM.IRBuilder, T::Vector{LLVM.Value})
-    curent_bb = position(B)
-    fn = LLVM.parent(curent_bb)
-    mod = LLVM.parent(fn)
+    curent_bb = B.insert_block
+    fn = curent_bb.parent
+    mod = fn.parent
     func, FT = declare_writebarrier!(mod)
     return call!(B, FT, func, T)
 end
 
+
+# Cast `ptr` to a pointer to `ST`, for a GEP into the fields of `ST`. Julia does not allow
+# a GEP on a GC-tracked pointer. Thus, a tracked pointer also gets a cast to the derived
+# address space.
+function struct_ptr!(B::LLVM.IRBuilder, @nospecialize(ptr::LLVM.Value), @nospecialize(ST::LLVM.LLVMType))
+    as = ptr.value_type.addrspace
+    ptr = LLVM.pointercast!(B, ptr, LLVM.PointerType(ST, as))
+    if as == Tracked
+        ptr = LLVM.addrspacecast!(B, ptr, LLVM.PointerType(ST, Derived))
+    end
+    return ptr
+end
 
 function get_array_struct()
     @static if VERSION < v"1.11-"
@@ -722,13 +884,13 @@ function get_array_struct()
         #     // T inl[];
         # #endif
         # } jl_genericmemory_t;
-        # 
+        #
         # JL_EXTENSION typedef struct {
         #     JL_DATA_TYPE
         #     void *ptr_or_offset;
         #     jl_genericmemory_t *mem;
         # } jl_genericmemoryref_t;
-        # 
+        #
         # JL_EXTENSION typedef struct {
         #     JL_DATA_TYPE
         #     jl_genericmemoryref_t ref;
@@ -742,46 +904,42 @@ function get_array_struct()
 end
 
 function get_memory_struct()
-	# JL_EXTENSION typedef struct {
-	#     JL_DATA_TYPE
-	#     size_t length;
-	#     void *ptr;
-	#     // followed by padding and inline data, or owner pointer
-	# #ifdef _P64
-	#     // union {
-	#     //     jl_value_t *owner;
-	#     //     T inl[];
-	#     // };
-	# #else
-	#     //
-	#     // jl_value_t *owner;
-	#     // size_t padding[1];
-	#     // T inl[];
-	# #endif
-	# } jl_genericmemory_t;
+    # JL_EXTENSION typedef struct {
+    #     JL_DATA_TYPE
+    #     size_t length;
+    #     void *ptr;
+    #     // followed by padding and inline data, or owner pointer
+    # #ifdef _P64
+    #     // union {
+    #     //     jl_value_t *owner;
+    #     //     T inl[];
+    #     // };
+    # #else
+    #     //
+    #     // jl_value_t *owner;
+    #     // size_t padding[1];
+    #     // T inl[];
+    # #endif
+    # } jl_genericmemory_t;
 
-	i8 = LLVM.IntType(8)
-	ptrty = LLVM.PointerType(i8)
-	sizeT = LLVM.IntType(8 * sizeof(Csize_t))
+    i8 = LLVM.IntType(8)
+    ptrty = LLVM.PointerType(i8)
+    sizeT = LLVM.IntType(8 * sizeof(Csize_t))
 
-	return LLVM.StructType([sizeT, ptrty]; packed = true)
+    return LLVM.StructType([sizeT, ptrty]; packed = true)
 end
 
 function get_memory_data(B::LLVM.IRBuilder, @nospecialize(array::LLVM.Value))
     mty = get_memory_struct()
-    array = LLVM.pointercast!(
-        B,
-        array,
-        LLVM.PointerType(mty, LLVM.addrspace(LLVM.value_type(array))),
-    )
+    array = struct_ptr!(B, array, mty)
     v = inbounds_gep!(
         B,
         mty,
         array,
         LLVM.Value[LLVM.ConstantInt(Int32(0)), LLVM.ConstantInt(Int32(1))],
     )
-	i8 = LLVM.IntType(8)
-	ptrty = LLVM.PointerType(i8)
+    i8 = LLVM.IntType(8)
+    ptrty = LLVM.PointerType(i8)
     return LLVM.load!(B, ptrty, v)
 end
 
@@ -814,9 +972,9 @@ function get_layout_struct()
     #     //     uint32_t ptr32[npointers];
     #     // };
     # } jl_datatype_layout_t;
-	i32 = LLVM.IntType(32)
-	i16 = LLVM.IntType(16)
-	return LLVM.StructType([i32, i32, i32, i32, i16, i16]; packed = true)
+    i32 = LLVM.IntType(32)
+    i16 = LLVM.IntType(16)
+    return LLVM.StructType([i32, i32, i32, i32, i16, i16]; packed = true)
 end
 
 function get_datatype_struct()
@@ -842,10 +1000,13 @@ function get_datatype_struct()
     #     uint16_t isidentityfree:1; // whether this type or any object reachable through its fields has non-content-based identity
     #     uint16_t smalltag:6; // whether this type has a small-tag optimization
     # } jl_datatype_t;
-	jlvaluet = LLVM.PointerType(LLVM.StructType(LLVMType[]), 10)
-	i32 = LLVM.IntType(32)
-	i16 = LLVM.IntType(16)
-	return LLVM.StructType([jlvaluet, jlvaluet, jlvaluet, jlvaluet, jlvaluet, jlvaluet, i32, i16]; packed = true)
+    jlvaluet = LLVM.PointerType(LLVM.StructType(LLVMType[]), 10)
+    # The layout field points to memory that the GC does not manage.
+    # Thus it is a pointer in address space 0 and not in address space 10.
+    lptr = LLVM.PointerType(get_layout_struct())
+    i32 = LLVM.IntType(32)
+    i16 = LLVM.IntType(16)
+    return LLVM.StructType([jlvaluet, jlvaluet, jlvaluet, jlvaluet, jlvaluet, lptr, i32, i16]; packed = true)
 end
 
 function get_array_data(B::LLVM.IRBuilder, @nospecialize(array::LLVM.Value))
@@ -854,7 +1015,7 @@ function get_array_data(B::LLVM.IRBuilder, @nospecialize(array::LLVM.Value))
     array = LLVM.pointercast!(
         B,
         array,
-        LLVM.PointerType(ptrty, LLVM.addrspace(LLVM.value_type(array))),
+        LLVM.PointerType(ptrty, array.value_type.addrspace),
     )
     return LLVM.load!(B, ptrty, array)
 end
@@ -862,11 +1023,7 @@ end
 function get_array_elsz(B::LLVM.IRBuilder, @nospecialize(array::LLVM.Value))
     ST = get_array_struct()
     elsz = LLVM.IntType(16)
-    array = LLVM.pointercast!(
-        B,
-        array,
-        LLVM.PointerType(ST, LLVM.addrspace(LLVM.value_type(array))),
-    )
+    array = struct_ptr!(B, array, ST)
     v = inbounds_gep!(
         B,
         ST,
@@ -876,76 +1033,76 @@ function get_array_elsz(B::LLVM.IRBuilder, @nospecialize(array::LLVM.Value))
     return LLVM.load!(B, elsz, v)
 end
 
-function emit_layout_of_type!(B::LLVM.IRBuilder, @nospecialize(ty::LLVM.Value))
-	legal, JTy = absint(ty)
-	ls = get_layout_struct()
-	lptr = LLVM.PointerType(ls, 10)
-	if legal
-		return LLVM.const_inttoptr(LLVM.ConstantInt(Base.reinterpret(UInt, JTy.layout)), lptr)
-	end
-	@assert !isa(ty, LLVM.ConstantExpr)
-	@assert !isa(ty, LLVM.Constant)
-	dt = get_datatype_struct()
-	lty = bitcast!(B, ty, LLVM.PointerType(dt, addrspace(value_type(ty))))
-	layoutp = inbounds_gep!(B, dt, lty, 
+function emit_layout_of_type!(B::LLVM.IRBuilder, @nospecialize(ty::LLVM.Value), enzyme_ctx::Union{EnzymeContext, Nothing})
+    legal, JTy = absint(ty, enzyme_ctx)
+    # The layout is not a GC object. Do not use address space 10 for it,
+    # because LateLowerGCFrame then puts the pointer in a GC frame slot
+    # and the GC writes mark bits before the layout.
+    lptr = LLVM.PointerType(get_layout_struct())
+    if legal
+        JTy = unbind(JTy)
+        return LLVM.const_inttoptr(LLVM.ConstantInt(Base.reinterpret(UInt, JTy.layout)), lptr)
+    end
+    @assert !isa(ty, LLVM.ConstantExpr)
+    @assert !isa(ty, LLVM.Constant)
+    dt = get_datatype_struct()
+    lty = struct_ptr!(B, ty, dt)
+    layoutp = inbounds_gep!(
+        B, dt, lty,
         LLVM.Value[LLVM.ConstantInt(Int32(0)), LLVM.ConstantInt(Int32(5))],
-	)
-	jlvaluet = LLVM.PointerType(LLVM.StructType(LLVMType[]), 10)
-	layout = load!(B, jlvaluet, layoutp)
-    layout = bitcast!(B, layout, lptr)
-	return layout
+    )
+    return load!(B, lptr, layoutp)
 end
 
-function emit_memorytype_elsz!(B::LLVM.IRBuilder, @nospecialize(ty::LLVM.Value))
-	legal, JTy = absint(ty)
-	if legal
-		res = unsafe_load(reinterpret(Ptr{UInt32}, JTy.layout))
-		return LLVM.ConstantInt(res)
-	end
-	ty = emit_layout_of_type!(B, ty)
-	@assert !isa(ty, LLVM.ConstantExpr)
-	@assert !isa(ty, LLVM.Constant)
-	i32 = LLVM.IntType(32)
-	lty = bitcast!(B, ty, LLVM.PointerType(i32, addrspace(value_type(ty))))
-	return load!(B, i32, lty)
+function emit_type_layout_elsz!(B::LLVM.IRBuilder, @nospecialize(ty::LLVM.Value), enzyme_ctx::Union{EnzymeContext, Nothing})
+    legal, JTy = absint(ty, enzyme_ctx)
+    if legal
+        JTy = unbind(JTy)
+        @assert JTy isa Type
+        res = Compiler.datatype_layoutsize(JTy)
+        return LLVM.ConstantInt(res)
+    end
+
+    ty = emit_layout_of_type!(B, ty, enzyme_ctx)
+    @assert !isa(ty, LLVM.ConstantExpr)
+    @assert !isa(ty, LLVM.Constant)
+    i32 = LLVM.IntType(32)
+    lty = bitcast!(B, ty, LLVM.PointerType(i32, ty.value_type.addrspace))
+    return load!(B, i32, lty)
 end
 
-function get_memory_elsz(B::LLVM.IRBuilder, @nospecialize(array::LLVM.Value))
-    ty = emit_jltypeof!(B, array)
-	return emit_memorytype_elsz!(B, ty)
+function get_memory_elsz(B::LLVM.IRBuilder, @nospecialize(array::LLVM.Value), enzyme_ctx::Union{EnzymeContext, Nothing})
+    ty = emit_jltypeof!(B, array, enzyme_ctx)
+    return emit_type_layout_elsz!(B, ty, enzyme_ctx)
 end
 
 function get_array_len(B::LLVM.IRBuilder, @nospecialize(array::LLVM.Value))
     if isa(array, LLVM.CallInst)
-        fn = LLVM.called_operand(array)
+        fn = array.called_operand
         nm = ""
         if isa(fn, LLVM.Function)
-            nm = LLVM.name(fn)
+            nm = fn.name
         end
 
         for (fname, num) in (
-            ("jl_alloc_array_1d", 1),
-            ("ijl_alloc_array_1d", 1),
-            ("jl_alloc_array_2d", 2),
-            ("jl_alloc_array_2d", 2),
-            ("jl_alloc_array_2d", 3),
-            ("jl_alloc_array_2d", 3),
-        )
+                ("jl_alloc_array_1d", 1),
+                ("ijl_alloc_array_1d", 1),
+                ("jl_alloc_array_2d", 2),
+                ("jl_alloc_array_2d", 2),
+                ("jl_alloc_array_2d", 3),
+                ("jl_alloc_array_2d", 3),
+            )
             if nm == fname
-                res = operands(array)[2]
-                for i = 2:num
-                    res = mul!(B, res, operands(array)[1+i])
+                res = array.operands[2]
+                for i in 2:num
+                    res = mul!(B, res, array.operands[1 + i])
                 end
                 return res
             end
         end
     end
     ST = get_array_struct()
-    array = LLVM.pointercast!(
-        B,
-        array,
-        LLVM.PointerType(ST, LLVM.addrspace(LLVM.value_type(array))),
-    )
+    array = struct_ptr!(B, array, ST)
     v = inbounds_gep!(
         B,
         ST,
@@ -956,33 +1113,37 @@ function get_array_len(B::LLVM.IRBuilder, @nospecialize(array::LLVM.Value))
     return LLVM.load!(B, sizeT, v)
 end
 
-function get_memory_len(B::LLVM.IRBuilder, @nospecialize(array::LLVM.Value))
+function get_memory_len(B::LLVM.IRBuilder, @nospecialize(array::LLVM.Value), enzyme_ctx::Union{EnzymeContext, Nothing})
     if isa(array, LLVM.CallInst)
-        fn = LLVM.called_operand(array)
+        fn = array.called_operand
         nm = ""
         if isa(fn, LLVM.Function)
-            nm = LLVM.name(fn)
+            nm = fn.name
         end
 
-        for (fname, num) in (
-            ("jl_alloc_genericmemory", 1),
-            ("ijl_alloc_genericmemory", 1),
-        )
-            if nm == fname
-                res = operands(array)[2]
-                for i = 2:num
-                    res = mul!(B, res, operands(array)[1+i])
-                end
-                return res
-            end
+        if nm in (
+                "jl_alloc_genericmemory",
+                "ijl_alloc_genericmemory",
+            )
+            res = array.operands[2]
+            return res
+        end
+        if nm == "julia.gc_alloc_memory"
+            # julia.gc_alloc_memory(task, nbytes, type, length, zeroinit)
+            return array.operands[4]
+        end
+        if nm in (
+                "jl_alloc_genericmemory_unchecked",
+                "ijl_alloc_genericmemory_unchecked",
+            )
+            # This is number of bytes not number of elements
+            res = get_memory_size(B, array)
+            es = get_memory_elsz(B, array, enzyme_ctx)
+            return udiv!(B, res, es)
         end
     end
     ST = get_memory_struct()
-    array = LLVM.pointercast!(
-        B,
-        array,
-        LLVM.PointerType(ST, LLVM.addrspace(LLVM.value_type(array))),
-    )
+    array = struct_ptr!(B, array, ST)
     v = inbounds_gep!(
         B,
         ST,
@@ -993,13 +1154,54 @@ function get_memory_len(B::LLVM.IRBuilder, @nospecialize(array::LLVM.Value))
     return LLVM.load!(B, sizeT, v)
 end
 
+
+# nel - number of elements
+#
+@static if VERSION >= v"1.11"
+    function get_memory_nbytes(B::LLVM.IRBuilder, memty::Type{<:Memory}, nel::LLVM.Value)
+        elsz = LLVM.ConstantInt(Compiler.datatype_layoutsize(memty))
+        isboxed = Base.datatype_arrayelem(memty) == 1
+        isunion = Base.datatype_arrayelem(memty) == 2
+
+        if isboxed
+            elsz = LLVM.ConstantInt(sizeof(Ptr{Cvoid}))
+        end
+        nbytes = LLVM.mul!(B, nel, elsz)
+
+        if isunion
+            # an extra byte for each isbits union memory element, stored at m->ptr + m->length
+            nbytes = LLVM.add!(B, nbytes, nel)
+        end
+        return nbytes
+    end
+end
+
+function get_memory_nbytes(B::LLVM.IRBuilder, @nospecialize(array::LLVM.Value), enzyme_ctx::Union{EnzymeContext, Nothing})
+    if isa(array, LLVM.CallInst)
+        fn = array.called_operand
+        nm = ""
+        if isa(fn, LLVM.Function)
+            nm = fn.name
+        end
+        if nm in (
+                "jl_alloc_genericmemory_unchecked",
+                "ijl_alloc_genericmemory_unchecked",
+                "julia.gc_alloc_memory",
+            )
+            # This is number of bytes not number of elements
+            res = array.operands[2]
+            return res
+        end
+    end
+    nel = get_memory_len(B, array, enzyme_ctx)
+    legal, memty = abs_typeof(array, enzyme_ctx)
+    @assert legal
+    return get_memory_nbytes(B, memty, nel)
+end
+
 function get_array_nrows(B::LLVM.IRBuilder, @nospecialize(array::LLVM.Value))
     ST = get_array_struct()
-    array = LLVM.pointercast!(
-        B,
-        array,
-        LLVM.PointerType(ST, LLVM.addrspace(LLVM.value_type(array))),
-    )
+    array = struct_ptr!(B, array, ST)
     v = inbounds_gep!(
         B,
         ST,
@@ -1011,9 +1213,9 @@ function get_array_nrows(B::LLVM.IRBuilder, @nospecialize(array::LLVM.Value))
 end
 
 function emit_gc_preserve_begin(B::LLVM.IRBuilder, args::Vector{LLVM.Value} = LLVM.Value[])
-    curent_bb = position(B)
-    fn = LLVM.parent(curent_bb)
-    mod = LLVM.parent(fn)
+    curent_bb = B.insert_block
+    fn = curent_bb.parent
+    mod = fn.parent
     func, FT = get_function!(
         mod,
         "llvm.julia.gc_preserve_begin",
@@ -1025,9 +1227,9 @@ function emit_gc_preserve_begin(B::LLVM.IRBuilder, args::Vector{LLVM.Value} = LL
 end
 
 function emit_gc_preserve_end(B::LLVM.IRBuilder, @nospecialize(token::LLVM.Value))
-    curent_bb = position(B)
-    fn = LLVM.parent(curent_bb)
-    mod = LLVM.parent(fn)
+    curent_bb = B.insert_block
+    fn = curent_bb.parent
+    mod = fn.parent
 
     func, FT = get_function!(
         mod,
@@ -1048,49 +1250,49 @@ end
 
 function allocate_sret!(gutils::API.EnzymeGradientUtilsRef, @nospecialize(N::LLVM.LLVMType))
     B = LLVM.IRBuilder()
-    position!(B, LLVM.BasicBlock(API.EnzymeGradientUtilsAllocationBlock(gutils)))
-    allocate_sret!(B, N)
+    position!(B, LLVM.at_end(LLVM.BasicBlock(API.EnzymeGradientUtilsAllocationBlock(gutils))))
+    return allocate_sret!(B, N)
 end
 
 function emit_printf(B::LLVM.IRBuilder, string::String, v::LLVM.Value...)
-    curent_bb = position(B)
-    fn = LLVM.parent(curent_bb)
-    mod = LLVM.parent(fn)
+    curent_bb = B.insert_block
+    fn = curent_bb.parent
+    mod = fn.parent
 
     string = globalstring_ptr!(B, string, "enz_printf")
     vt = LLVM.VoidType()
     args = LLVM.Value[string, v...]
     for i in 1:length(args)
-        if value_type(args[i]) isa LLVM.PointerType
-            if LLVM.addrspace(value_type(args[i])) == 10
-                args[i] = addrspacecast!(B, args[i], LLVM.PointerType(eltype(value_type(args[i])), 11))
+        if args[i].value_type isa LLVM.PointerType
+            if args[i].value_type.addrspace == 10
+                args[i] = addrspacecast!(B, args[i], LLVM.PointerType(args[i].value_type.element_type, 11))
             end
-            if LLVM.addrspace(value_type(args[i])) == 11
+            if args[i].value_type.addrspace == 11
                 args[i] = emit_pointerfromobjref!(B, args[i])
             end
         end
     end
-    exc, _ = get_function!(mod, "printf", LLVM.FunctionType(vt, [value_type(string)], ;vararg=true))
-    call!(B, LLVM.function_type(exc), exc, args)
+    exc, _ = get_function!(mod, "printf", LLVM.FunctionType(vt, [string.value_type], ; vararg = true))
+    return call!(B, exc.function_type, exc, args)
 end
 
 function emit_error(B::LLVM.IRBuilder, @nospecialize(orig::Union{Nothing, LLVM.Instruction}), string::Union{String, LLVM.Value, Tuple{String, Core.MethodInstance, UInt}}, @nospecialize(errty::Type) = EnzymeRuntimeException, @nospecialize(cond::Union{Nothing, LLVM.Value}) = nothing)
-    curent_bb = position(B)
-    fn = LLVM.parent(curent_bb)
-    mod = LLVM.parent(fn)
+    curent_bb = B.insert_block
+    fn = curent_bb.parent
+    mod = fn.parent
 
     stringv = string
     if stringv isa Tuple
-	stringv = stringv[1]
+        stringv = stringv[1]
     end
     if !isa(stringv, LLVM.Value)
         stringv = globalstring_ptr!(B, stringv, "enz_exception")
     end
 
-    ct = if occursin("ptx", LLVM.triple(mod)) || occursin("amdgcn", LLVM.triple(mod))
-	if string isa Tuple
-	    errty = errty.name.wrapper{Nothing, Nothing}
-	end
+    ct = if occursin("ptx", mod.triple) || occursin("amdgcn", mod.triple)
+        if string isa Tuple
+            errty = errty.name.wrapper{Nothing, Nothing}
+        end
         vt = LLVM.VoidType()
         ptr = convert(LLVMType, Ptr{Cvoid})
 
@@ -1099,7 +1301,7 @@ function emit_error(B::LLVM.IRBuilder, @nospecialize(orig::Union{Nothing, LLVM.I
 
         stringv = ptrtoint!(B, stringv, ptr)
 
-        call!(B, LLVM.function_type(exc), exc, [stringv])
+        call!(B, exc.function_type, exc, [stringv])
 
         framefn, ft = get_function!(
             mod,
@@ -1110,12 +1312,12 @@ function emit_error(B::LLVM.IRBuilder, @nospecialize(orig::Union{Nothing, LLVM.I
         if orig !== nothing
             bt = GPUCompiler.backtrace(orig)
             for (i, frame) in enumerate(bt)
-                idx = ConstantInt(parameters(ft)[1], i)
+                idx = ConstantInt(ft.parameters[1], i)
                 func = globalstring_ptr!(B, String(frame.func), "di_func")
                 func = ptrtoint!(B, func, ptr)
                 file = globalstring_ptr!(B, String(frame.file), "di_file")
                 file = ptrtoint!(B, file, ptr)
-                line = ConstantInt(parameters(ft)[4], frame.line)
+                line = ConstantInt(ft.parameters[4], frame.line)
                 call!(B, ft, framefn, [idx, func, file, line])
             end
         end
@@ -1127,55 +1329,46 @@ function emit_error(B::LLVM.IRBuilder, @nospecialize(orig::Union{Nothing, LLVM.I
         )
         call!(B, sigft, sigfn)
         trap_ft = LLVM.FunctionType(LLVM.VoidType())
-        trap = if haskey(functions(mod), "llvm.trap")
-            functions(mod)["llvm.trap"]
+        trap = if haskey(mod.functions, "llvm.trap")
+            mod.functions["llvm.trap"]
         else
             LLVM.Function(mod, "llvm.trap", trap_ft)
         end
         call!(B, trap_ft, trap)
     else
-    	if cond !== nothing
-	    if string isa Tuple
-	       errty = errty.name.wrapper{Nothing, Nothing}
-	    end
+        if cond !== nothing
+            if string isa Tuple
+                errty = errty.name.wrapper{Nothing, Nothing}
+            end
             emit_conditional_throw!(B, cond, errty, stringv)
-    	else
+        else
             err = emit_allocobj!(B, errty)
             err2 = bitcast!(B, err, LLVM.PointerType(LLVM.PointerType(LLVM.Int8Type()), 10))
             err2 = addrspacecast!(B, err2, LLVM.PointerType(LLVM.PointerType(LLVM.Int8Type()), Derived))
             store!(B, stringv, err2)
-	    if string isa Tuple
-	       g1 = LLVM.inbounds_gep!(B, LLVM.PointerType(LLVM.Int8Type()), err2, [LLVM.ConstantInt(1)])
-	       ts = unsafe_to_llvm(B, string[2])
-	       g1 = LLVM.bitcast!(B, g1, LLVM.PointerType(value_type(ts), Derived))
-	       store!(B, ts, g1)
-	       g2 = LLVM.inbounds_gep!(B, LLVM.PointerType(LLVM.Int8Type()), err2, [LLVM.ConstantInt(2)])
-	       ts = LLVM.ConstantInt(string[3])
-	       g2 = LLVM.bitcast!(B, g2, LLVM.PointerType(value_type(ts), Derived))
-	       store!(B, ts, g2)
-	    end
-    		emit_jl_throw!(
-    		    B,
-    		    addrspacecast!(B, err, LLVM.PointerType(LLVM.StructType(LLVMType[]), 12)),
-    		)
-    	end
+            if string isa Tuple
+                g1 = LLVM.inbounds_gep!(B, LLVM.PointerType(LLVM.Int8Type()), err2, [LLVM.ConstantInt(1)])
+                ts = unsafe_to_llvm(B, string[2])
+                g1 = LLVM.bitcast!(B, g1, LLVM.PointerType(ts.value_type, Derived))
+                store!(B, ts, g1)
+                g2 = LLVM.inbounds_gep!(B, LLVM.PointerType(LLVM.Int8Type()), err2, [LLVM.ConstantInt(2)])
+                ts = LLVM.ConstantInt(string[3])
+                g2 = LLVM.bitcast!(B, g2, LLVM.PointerType(ts.value_type, Derived))
+                store!(B, ts, g2)
+            end
+            emit_jl_throw!(
+                B,
+                addrspacecast!(B, err, LLVM.PointerType(LLVM.StructType(LLVMType[]), 12)),
+            )
+        end
     end
 
     # 2. Call error function and insert unreachable
     if cond === nothing
-	    LLVM.API.LLVMAddCallSiteAttribute(
-		ct,
-		reinterpret(LLVM.API.LLVMAttributeIndex, LLVM.API.LLVMAttributeFunctionIndex),
-		EnumAttribute("noreturn"),
-	    )
-	    if EnzymeMutabilityException != errty
-		LLVM.API.LLVMAddCallSiteAttribute(
-		    ct,
-		    reinterpret(LLVM.API.LLVMAttributeIndex, LLVM.API.LLVMAttributeFunctionIndex),
-		    StringAttribute("enzyme_error"),
-		)
-	    end
+        push!(ct.function_attributes, EnumAttribute(:noreturn))
+        if EnzymeMutabilityException != errty
+            push!(ct.function_attributes, StringAttribute("enzyme_error"))
+        end
     end
     return ct
 end
-

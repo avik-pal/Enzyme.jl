@@ -1,0 +1,103 @@
+using Enzyme, Test
+using Enzyme.Compiler: EnzymeTarget, EnzymeCompilerParams, PrimalCompilerParams, UnknownTapeType
+using Enzyme: API, FFIABI
+const GPUCompiler = Enzyme.Compiler.GPUCompiler
+using .GPUCompiler: CompilerJob, CompilerConfig
+
+# A pretend backend that, like CUDA.jl, defines its method table only for its own job type.
+struct MTTestTarget <: GPUCompiler.AbstractCompilerTarget end
+struct MTTestParams <: GPUCompiler.AbstractCompilerParams end
+Base.Experimental.@MethodTable(mt_test_table)
+GPUCompiler.method_table(@nospecialize(job::CompilerJob{MTTestTarget, MTTestParams})) = mt_test_table
+
+mt_test_fn(x::Float64) = x
+Base.Experimental.@overlay mt_test_table mt_test_fn(x::Float64) = "overlaid"
+# The overlay is picked up at call sites, so infer a caller. Use a separate caller per
+# job: before Julia 1.11 Enzyme keeps one global code cache per mode, shared across method
+# tables, so inferring the same method instance under both tables would reuse the first
+# result.
+mt_test_native_caller(x::Float64) = mt_test_fn(x)
+mt_test_overlay_caller(x::Float64) = mt_test_fn(x)
+
+function enzyme_job(caller, inner_target, inner_params, mode, world)
+    mi = Enzyme.Compiler.my_methodinstance(Reverse, typeof(caller), Tuple{Float64}, world)
+    params = EnzymeCompilerParams(
+        Tuple{Const{typeof(caller)}, Active{Float64}}, mode, 1, Active{Float64},
+        true, true, (false, false), false, false, UnknownTapeType, FFIABI, false, false, false,
+    )
+    target = GPUCompiler.nest_target(EnzymeTarget(), inner_target)
+    params = GPUCompiler.nest_params(params, inner_params)
+    return mi, CompilerJob(mi, CompilerConfig(target, params; kernel = false), world)
+end
+
+@testset "method_table forwards through EnzymeTarget" begin
+    world = Base.get_world_counter()
+    mode = API.DEM_ReverseModeCombined
+
+    mi, native_job = enzyme_job(mt_test_native_caller, GPUCompiler.NativeCompilerTarget(), PrimalCompilerParams(mode), mode, world)
+    @test GPUCompiler.method_table(native_job) === GPUCompiler.GLOBAL_METHOD_TABLE
+    @test Enzyme.Compiler.return_type(GPUCompiler.get_interpreter(native_job), mi) === Float64
+
+    mi, backend_job = enzyme_job(mt_test_overlay_caller, MTTestTarget(), MTTestParams(), mode, world)
+    @test backend_job.config.target isa EnzymeTarget{MTTestTarget}
+    @test backend_job.config.params isa EnzymeCompilerParams{MTTestParams}
+    @test GPUCompiler.method_table(backend_job) === mt_test_table
+
+    interp = GPUCompiler.get_interpreter(backend_job)
+    # The view type depends on the GPUCompiler version (`MethodTableStack` from 2.22 on).
+    @test first(Enzyme.Compiler.method_tables(Core.Compiler.method_table(interp))) === mt_test_table
+    # Inference under the Enzyme job now sees the backend's overlay, as the primal job does.
+    @test Enzyme.Compiler.return_type(interp, mi) === String
+    @static if VERSION >= v"1.11.0-DEV.1552"
+        # GPUCompiler 2 adds its shared method table below the method table of the backend.
+        expected = if isdefined(GPUCompiler, :SHARED_METHOD_TABLE)
+            (mt_test_table, GPUCompiler.SHARED_METHOD_TABLE)
+        else
+            (mt_test_table,)
+        end
+        @test Enzyme.Compiler.enzyme_cache_owner(backend_job).method_tables === expected
+    end
+end
+
+# A pretend backend that, like OpenCL.jl, stacks a shared method table underneath its own,
+# by defining `method_table_view`.
+struct MTStackTarget <: GPUCompiler.AbstractCompilerTarget end
+struct MTStackParams <: GPUCompiler.AbstractCompilerParams end
+Base.Experimental.@MethodTable(mt_shared_table)
+GPUCompiler.method_table(@nospecialize(job::CompilerJob{MTStackTarget, MTStackParams})) = mt_test_table
+GPUCompiler.method_table_view(@nospecialize(job::CompilerJob{MTStackTarget, MTStackParams})) =
+    GPUCompiler.StackedMethodTable(job.world, mt_test_table, mt_shared_table)
+
+mt_shared_fn(x::Float64) = x
+Base.Experimental.@overlay mt_shared_table mt_shared_fn(x::Float64) = "shared"
+mt_test_stacked_caller(x::Float64) = (mt_test_fn(x), mt_shared_fn(x))
+
+@testset "method_table_view forwards through EnzymeTarget" begin
+    world = Base.get_world_counter()
+    mode = API.DEM_ReverseModeCombined
+
+    mi, job = enzyme_job(mt_test_stacked_caller, MTStackTarget(), MTStackParams(), mode, world)
+    @test GPUCompiler.method_table_view(job) isa GPUCompiler.StackedMethodTable
+
+    # Inference under the Enzyme job sees both the backend's and the shared overlay.
+    interp = GPUCompiler.get_interpreter(job)
+    @test Core.Compiler.method_table(interp) isa GPUCompiler.StackedMethodTable
+    @test Enzyme.Compiler.return_type(interp, mi) === Tuple{String, String}
+
+    # Method lookups (e.g. for the primal of a kernel) go through every table in the stack.
+    view = Core.Compiler.method_table(interp)
+    shared_mi = Enzyme.my_methodinstance(view, typeof(mt_shared_fn), Tuple{Float64}, world)
+    @test shared_mi.def !== which(mt_shared_fn, Tuple{Float64})
+    caller_mi = Enzyme.my_methodinstance(view, typeof(mt_test_stacked_caller), Tuple{Float64}, world)
+    @test caller_mi.def === which(mt_test_stacked_caller, Tuple{Float64})
+
+    @static if VERSION >= v"1.11.0-DEV.1552"
+        # The cache token covers the whole stack, so it differs from that of a backend that
+        # only uses the same main table.
+        token = Enzyme.Compiler.enzyme_cache_owner(job)
+        @test token.method_tables === (mt_test_table, mt_shared_table)
+        @test Core.Compiler.cache_owner(interp) === token
+        _, other_job = enzyme_job(mt_test_overlay_caller, MTTestTarget(), MTTestParams(), mode, world)
+        @test token !== Enzyme.Compiler.enzyme_cache_owner(other_job)
+    end
+end
